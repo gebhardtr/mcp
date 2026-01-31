@@ -438,3 +438,292 @@ class TestCloudSdkTools:
                 assert result["client"] == "x.y.FakeClient"
                 assert result["operation"] == "get_widget"
                 assert result["data"] == {"id": "w1", "ok": True}
+
+
+class TestGetClientOperationDetailsTool:
+    @pytest.mark.asyncio
+    async def test_get_client_operation_details_success(self, monkeypatch):
+        # define a method with Sphinx-style doc, explicit expected_kwargs, and basic annotations
+        def list_things(self, compartment_id: str, page=None, limit=None) -> list:
+            """
+            List things.
+
+            :param str compartment_id: OCID of compartment
+            :returns: Items
+            :rtype: list
+            """
+            expected_kwargs = ["page", "limit"]  # noqa: F841
+            return []
+
+        DetailClientX = type("DetailClientX", (), {"list_things": list_things})
+        fake_module = SimpleNamespace(DetailClientX=DetailClientX)
+
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.import_module",
+            lambda name: fake_module,
+        )
+
+        async with Client(mcp) as client:
+            res = (
+                await client.call_tool(
+                    "get_client_operation_details",
+                    {
+                        "client_fqn": "detail.mod.DetailClientX",
+                        "operation": "list_things",
+                    },
+                )
+            ).data
+
+        assert res["client"] == "detail.mod.DetailClientX"
+        assert res["operation"] == "list_things"
+        assert res["supports_pagination"] is True
+        # parameter extraction includes 'compartment_id'
+        param_names = {p["name"] for p in res["parameters"]}
+        assert "compartment_id" in param_names
+        # expected_kwargs should include page/limit
+        assert isinstance(res["expected_kwargs"], list) and "page" in res["expected_kwargs"]
+        # doc parsing captured params and returns
+        assert "compartment_id" in res["doc"]["params"]
+        assert res["doc"]["returns"]["type"] in (None, "list", "List")
+        # source location best-effort fields present
+        assert "source" in res and "file" in res["source"]
+
+    @pytest.mark.asyncio
+    async def test_get_client_operation_details_error_payload(self, monkeypatch):
+        # class exists but operation missing -> error payload returned by tool
+        fake_module = SimpleNamespace(Klass=type("Klass", (), {}))
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.import_module",
+            lambda name: fake_module,
+        )
+
+        async with Client(mcp) as client:
+            res = (
+                await client.call_tool(
+                    "get_client_operation_details",
+                    {"client_fqn": "x.y.Klass", "operation": "missing"},
+                )
+            ).data
+
+        assert "error" in res and "not found" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_client_operation_details_parses_google_style_doc(self, monkeypatch):
+        # Google-style Args/Returns parsing and expected_kwargs extraction
+        def getit(self, name):
+            """
+            Do it.
+
+            Args:
+                name (str): Resource name
+            Returns:
+                dict: Result mapping
+            """
+            expected_kwargs = ["limit"]  # noqa: F841
+            return {}
+
+        G = type("G", (), {"getit": getit})
+        fake_module = SimpleNamespace(G=G)
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.import_module",
+            lambda name: fake_module,
+        )
+
+        async with Client(mcp) as client:
+            res = (
+                await client.call_tool(
+                    "get_client_operation_details",
+                    {"client_fqn": "mod.G", "operation": "getit"},
+                )
+            ).data
+
+        assert res["doc"]["params"]["name"]["description"]
+        assert res["doc"]["returns"]["type"] in ("dict", None)
+        assert res["supports_pagination"] is True
+
+
+class TestListClientsTool:
+    @pytest.mark.asyncio
+    async def test_list_clients_discovers_and_filters(self, monkeypatch):
+        # Build fake modules for pkgutil.walk_packages to discover
+        foo_mod = SimpleNamespace(__name__="oci.foo")
+        bar_mod = SimpleNamespace(__name__="oci.bar")
+        models_mod = SimpleNamespace(__name__="oci.bar.models")  # should be skipped
+
+        # Define client classes and assign __module__ so list_clients accepts them
+        class FooClient:
+            """Foo client summary."""
+            pass
+
+        class _PrivateClient:
+            pass
+
+        FooClient.__module__ = "oci.foo"
+        _PrivateClient.__module__ = "oci.foo"
+        setattr(foo_mod, "FooClient", FooClient)
+        setattr(foo_mod, "_PrivateClient", _PrivateClient)
+
+        class BarClient:
+            """Bar client summary."""
+            pass
+
+        BarClient.__module__ = "oci.bar"
+        setattr(bar_mod, "BarClient", BarClient)
+
+        # Patch walk_packages to yield our fake module names (including a models package to skip)
+        def fake_walk(path, prefix):
+            assert prefix == "oci."
+            yield SimpleNamespace(name="oci.foo")
+            yield SimpleNamespace(name="oci.bar")
+            yield SimpleNamespace(name="oci.bar.models")
+            yield SimpleNamespace(name="oci._internal")  # private -> skip
+
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.pkgutil.walk_packages", fake_walk
+        )
+
+        # Patch import_module to return our fake modules
+        def fake_import(name):
+            if name == "oci.foo":
+                return foo_mod
+            if name == "oci.bar":
+                return bar_mod
+            if name == "oci.bar.models":
+                return models_mod
+            raise ImportError(name)
+
+        monkeypatch.setattr("oracle.oci_cloud_mcp_server.server.import_module", fake_import)
+        # Provide a minimal oci object with __path__ and __name__
+        monkeypatch.setattr("oracle.oci_cloud_mcp_server.server.oci", SimpleNamespace(__path__=[], __name__="oci"))
+
+        async with Client(mcp) as client:
+            res = (await client.call_tool("list_clients", {})).data
+
+        assert "clients" in res and isinstance(res["clients"], list)
+        fqns = [c["fqn"] for c in res["clients"]]
+        assert "oci.foo.FooClient" in fqns
+        assert "oci.bar.BarClient" in fqns
+        # Ensure models and private not included
+        assert all("models" not in f for f in fqns)
+        assert all(not f.endswith("._PrivateClient") for f in fqns)
+        # Deterministic ordering by fqn
+        assert fqns == sorted(fqns)
+
+    @pytest.mark.asyncio
+    async def test_list_clients_handles_import_errors(self, monkeypatch):
+        # walk_packages yields one good, one bad module
+        def fake_walk(path, prefix):
+            yield SimpleNamespace(name="oci.good")
+            yield SimpleNamespace(name="oci.bad")
+
+        good_mod = SimpleNamespace(__name__="oci.good")
+
+        class GoodClient:
+            pass
+
+        GoodClient.__module__ = "oci.good"
+        setattr(good_mod, "GoodClient", GoodClient)
+
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.pkgutil.walk_packages", fake_walk
+        )
+
+        def fake_import(name):
+            if name == "oci.good":
+                return good_mod
+            raise ImportError("boom")
+
+        monkeypatch.setattr("oracle.oci_cloud_mcp_server.server.import_module", fake_import)
+        monkeypatch.setattr("oracle.oci_cloud_mcp_server.server.oci", SimpleNamespace(__path__=[], __name__="oci"))
+
+        async with Client(mcp) as client:
+            res = (await client.call_tool("list_clients", {})).data
+
+        fqns = [c["fqn"] for c in res.get("clients", [])]
+        assert "oci.good.GoodClient" in fqns
+
+
+class TestDocParseAndHelpers:
+    def test_parse_docstring_parameters_and_type_lines(self):
+        from oracle.oci_cloud_mcp_server.server import _parse_docstring
+
+        doc = """Summary line.
+
+        Parameters:
+            alpha (int): first line
+                continued details
+        :param beta: beta description
+        :type beta: str
+        """
+        info = _parse_docstring(doc)
+        assert info["summary"] == "Summary line."
+        assert "alpha" in info["params"]
+        assert info["params"]["alpha"]["type"] in ("int", "Int")
+        assert "continued details" in info["params"]["alpha"]["description"]
+        assert "beta" in info["params"]
+        assert info["params"]["beta"]["type"] in ("str", "String")
+
+    def test_parse_docstring_returns_next_line_type_desc(self):
+        from oracle.oci_cloud_mcp_server.server import _parse_docstring
+
+        doc = """
+        X.
+
+        Returns:
+            dict: result mapping
+        """
+        info = _parse_docstring(doc)
+        assert info["returns"]["type"] in ("dict", "Dict")
+        assert "result mapping" in info["returns"]["description"]
+
+    def test_extract_expected_kwargs_none_and_empty(self):
+        from oracle.oci_cloud_mcp_server.server import _extract_expected_kwargs_from_source
+
+        # builtins generally don't have retrievable source -> None
+        assert _extract_expected_kwargs_from_source(len) is None
+
+        # user function without expected_kwargs -> set()
+        def f():
+            return 1
+
+        out = _extract_expected_kwargs_from_source(f)
+        assert isinstance(out, set) and len(out) == 0
+
+    @pytest.mark.asyncio
+    async def test_list_clients_top_level_error_payload(self, monkeypatch):
+        # Force pkgutil.walk_packages to raise so outer try/except returns {"error": ...}
+        def boom(*args, **kwargs):
+            raise RuntimeError("explode")
+
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.pkgutil.walk_packages", boom
+        )
+        # oci.__path__ is still needed when list_clients starts; provide minimal oci
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.oci", SimpleNamespace(__path__=[], __name__="oci")
+        )
+
+        async with Client(mcp) as client:
+            res = (await client.call_tool("list_clients", {})).data
+        assert "error" in res and "explode" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_client_operation_details_attr_not_callable(self, monkeypatch):
+        # Class exists but attribute is not a function/method
+        class C:
+            x = 1
+
+        fake_module = SimpleNamespace(C=C)
+        monkeypatch.setattr(
+            "oracle.oci_cloud_mcp_server.server.import_module", lambda name: fake_module
+        )
+
+        async with Client(mcp) as client:
+            res = (
+                await client.call_tool(
+                    "get_client_operation_details", {"client_fqn": "mod.C", "operation": "x"}
+                )
+            ).data
+
+        assert "error" in res
+        assert "not a function" in res["error"].lower() or "not a function/method" in res["error"].lower()

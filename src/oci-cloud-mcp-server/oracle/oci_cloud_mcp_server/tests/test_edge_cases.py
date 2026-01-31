@@ -11,6 +11,10 @@ from oracle.oci_cloud_mcp_server.server import (
     _resolve_model_class,
     _serialize_oci_data,
     _supports_pagination,
+    _iter_strings,
+    _infer_region_from_params,
+    _maybe_set_client_region,
+    _region_from_code,
     mcp,
 )
 
@@ -915,6 +919,37 @@ class TestSupportsPaginationHeuristics:
             pass
 
         assert _supports_pagination(get_zone_records, "get_zone_records") is True
+
+
+class TestRegionInferenceAndClientRegion:
+    def test_iter_strings_and_infer_region_from_ocid(self):
+        nested = {"items": [{"id": "ocid1.instance.oc1.iad.aaaa"}, "x"]}
+        strings = list(_iter_strings(nested))
+        assert "ocid1.instance.oc1.iad.aaaa" in strings
+        assert _infer_region_from_params(nested) == "us-ashburn-1"
+
+    def test_region_from_code_and_availability_domain(self):
+        assert _region_from_code("iad") == "us-ashburn-1"
+        assert _region_from_code("phx") == "us-phoenix-1"
+        # availability_domain string should map to region
+        assert _infer_region_from_params({"availability_domain": "US-PHOENIX-AD-2"}) == "us-phoenix-1"
+
+    def test_maybe_set_client_region_sets_on_base_client(self):
+        class Base:
+            def __init__(self):
+                self.region = None
+
+            def set_region(self, r):
+                self.region = r
+
+        class Client:
+            def __init__(self):
+                self.base_client = Base()
+
+        c = Client()
+        params = {"id": "ocid1.instance.oc1.iad.abc"}
+        _maybe_set_client_region(c, params)
+        assert c.base_client.region == "us-ashburn-1"
 
     def test_supports_pagination_default_false(self):
         def get_config(id):  # noqa: ARG001

@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import pkgutil
 from importlib import import_module
 from logging import Logger
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
@@ -29,6 +30,8 @@ mcp = FastMCP(
         invoking API clients and operations in-process (no CLI).
         - invoke_oci_api: Call any OCI SDK client operation by FQN and method.
         - list_client_operations: Discover available operations on a client.
+        - list_clients: List available OCI SDK clients and their short descriptions.
+        - get_client_operation_details: Inspect a client's operation to return signature, parameter details, docstrings, return info, pagination support, and source location.
     """,
 )
 
@@ -216,8 +219,19 @@ def _construct_model_from_mapping(
         try:
             return oci.util.from_dict(resolved_cls, filtered_clean)
         except Exception:
+            # If from_dict fails (e.g., no swagger_types to guide nested coercion),
+            # coerce nested mapping values using parent prefix hints before calling the constructor.
+            parent_prefix_hint: Optional[str] = None
+            for cand in candidate_classnames:
+                if isinstance(cand, str) and cand:
+                    if cand.endswith("Details"):
+                        parent_prefix_hint = cand[: -len("Details")]
+                        break
+                    if parent_prefix_hint is None:
+                        parent_prefix_hint = cand
+            coerced_filtered = _coerce_mapping_values(filtered_clean, models_module, parent_prefix=parent_prefix_hint)
             try:
-                return resolved_cls(**filtered_clean)
+                return resolved_cls(**coerced_filtered)
             except Exception:
                 pass
 
@@ -786,6 +800,346 @@ def list_client_operations(
     except Exception as e:
         logger.error(f"Error listing operations for {client_fqn}: {e}")
         raise
+
+
+@mcp.tool(description="List available OCI Python SDK client classes and their short descriptions.")
+def list_clients() -> dict:
+    """
+    Returns:
+      {
+        "clients": [
+          {
+            "fqn": "oci.core.ComputeClient",
+            "name": "ComputeClient",
+            "module": "oci.core",
+            "description": "One-line summary from the class docstring if available"
+          },
+          ...
+        ]
+      }
+    """
+    try:
+        seen = set()
+        clients: List[Dict[str, str]] = []
+        # Walk all subpackages/modules in the OCI SDK
+        for modinfo in pkgutil.walk_packages(oci.__path__, oci.__name__ + "."):
+            mod_name = modinfo.name
+
+            # Skip private modules and 'models' packages
+            if any(part.startswith("_") for part in mod_name.split(".")):
+                continue
+            if mod_name.endswith(".models") or ".models." in mod_name:
+                continue
+
+            try:
+                module = import_module(mod_name)
+            except Exception:
+                # best-effort import; ignore modules that fail to import
+                continue
+
+            # Find client classes defined in this module
+            for attr_name, obj in inspect.getmembers(module, inspect.isclass):
+                if not attr_name.endswith("Client"):
+                    continue
+                if attr_name.startswith("_"):
+                    continue
+
+                # Prefer classes actually defined in this module to avoid duplicates/re-exports
+                obj_mod = getattr(obj, "__module__", "")
+                if obj_mod != module.__name__:
+                    continue
+
+                fqn = f"{obj.__module__}.{obj.__name__}"
+                if fqn in seen:
+                    continue
+                seen.add(fqn)
+
+                doc = inspect.getdoc(obj) or ""
+                summary = doc.splitlines()[0].strip() if doc else ""
+                clients.append(
+                    {
+                        "fqn": f"{obj.__module__}.{obj.__name__}",
+                        "name": obj.__name__,
+                        "module": obj.__module__,
+                        "description": summary,
+                    }
+                )
+
+        # Provide deterministic ordering
+        clients.sort(key=lambda x: x["fqn"])
+        logger.info(f"Found {len(clients)} OCI SDK clients")
+        return {"clients": clients}
+    except Exception as e:
+        logger.error(f"Error listing OCI SDK clients: {e}")
+        return {"error": str(e)}
+
+def _parse_docstring(doc: str) -> Dict[str, Any]:
+    """
+    Best-effort parser supporting common Sphinx/reST and Google-style docstrings.
+    Returns a mapping with summary, description, params[name] -> {type, description},
+    and returns {type, description}.
+    """
+    info: Dict[str, Any] = {
+        "summary": "",
+        "description": "",
+        "params": {},
+        "returns": {"type": None, "description": ""},
+    }
+    if not doc:
+        return info
+
+    lines = doc.splitlines()
+    info["summary"] = lines[0].strip() if lines else ""
+
+    i = 1
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Sphinx/reST :param type name: desc
+        m = re.match(r":param\s+([A-Za-z0-9_\[\],\.\s]+)\s+([A-Za-z0-9_]+)\s*:\s*(.*)", stripped)
+        if m:
+            typ = (m.group(1) or "").strip() or None
+            name = m.group(2).strip()
+            desc = (m.group(3) or "").strip()
+            info["params"].setdefault(name, {})
+            if typ:
+                info["params"][name]["type"] = typ
+            info["params"][name]["description"] = desc
+            i += 1
+            # continuation lines (indented, not starting with ':')
+            while i < len(lines) and lines[i].startswith("    ") and not lines[i].lstrip().startswith(":"):
+                info["params"][name]["description"] += " " + lines[i].strip()
+                i += 1
+            continue
+
+        # Sphinx/reST :param name: desc  (type may be specified separately via :type)
+        m = re.match(r":param\s+([A-Za-z0-9_]+)\s*:\s*(.*)", stripped)
+        if m:
+            name = m.group(1).strip()
+            desc = (m.group(2) or "").strip()
+            info["params"].setdefault(name, {})
+            info["params"][name]["description"] = desc
+            i += 1
+            while i < len(lines) and lines[i].startswith("    ") and not lines[i].lstrip().startswith(":"):
+                info["params"][name]["description"] += " " + lines[i].strip()
+                i += 1
+            continue
+
+        # Sphinx/reST :type name: type
+        m = re.match(r":type\s+([A-Za-z0-9_]+)\s*:\s*(.*)", stripped)
+        if m:
+            name = m.group(1).strip()
+            typ = (m.group(2) or "").strip()
+            info["params"].setdefault(name, {})
+            if typ:
+                info["params"][name]["type"] = typ
+            i += 1
+            continue
+
+        # Sphinx/reST :return: / :returns:
+        m = re.match(r":return[s]?\s*:\s*(.*)", stripped)
+        if m:
+            info["returns"]["description"] = (m.group(1) or "").strip()
+            i += 1
+            while i < len(lines) and lines[i].startswith("    ") and not lines[i].lstrip().startswith(":"):
+                info["returns"]["description"] += " " + lines[i].strip()
+                i += 1
+            continue
+
+        # Sphinx/reST :rtype:
+        m = re.match(r":rtype\s*:\s*(.*)", stripped)
+        if m:
+            info["returns"]["type"] = (m.group(1) or "").strip()
+            i += 1
+            continue
+
+        # Google-style Args/Parameters section
+        if stripped in ("Args:", "Arguments:", "Parameters:"):
+            section_indent = len(line) - len(line.lstrip())
+            i += 1
+            while i < len(lines):
+                l = lines[i]
+                if l.strip() == "":
+                    i += 1
+                    continue
+                indent = len(l) - len(l.lstrip())
+                if indent <= section_indent:
+                    break
+                mm = re.match(r"\s*([A-Za-z0-9_]+)\s*(?:\(([^)]+)\))?\s*:\s*(.*)", l)
+                if mm:
+                    name = mm.group(1).strip()
+                    typ = (mm.group(2) or "").strip() or None
+                    desc = (mm.group(3) or "").strip()
+                    info["params"].setdefault(name, {})
+                    if typ:
+                        info["params"][name]["type"] = typ
+                    info["params"][name]["description"] = desc
+                    i += 1
+                    # consume continuation lines more indented than current param line
+                    while i < len(lines) and (len(lines[i]) - len(lines[i].lstrip())) > indent:
+                        info["params"][name]["description"] += " " + lines[i].strip()
+                        i += 1
+                    continue
+                else:
+                    i += 1
+            continue
+
+        # Google-style Returns:
+        if stripped.startswith("Returns:"):
+            # Inline "Returns: type: desc" or "Returns:" then next line
+            rest = stripped[len("Returns:"):].strip()
+            if rest:
+                # sometimes "type: desc" inline
+                mm = re.match(r"([A-Za-z0-9_\[\],\.\s]+)\s*:\s*(.*)", rest)
+                if mm:
+                    info["returns"]["type"] = (mm.group(1) or "").strip()
+                    info["returns"]["description"] = (mm.group(2) or "").strip()
+                else:
+                    info["returns"]["description"] = rest
+            i += 1
+            # If next line looks like "type: desc"
+            if i < len(lines) and lines[i].strip():
+                mm = re.match(r"\s*([A-Za-z0-9_\[\],\.\s]+)\s*:\s*(.*)", lines[i])
+                if mm:
+                    info["returns"]["type"] = (mm.group(1) or "").strip()
+                    info["returns"]["description"] = (
+                        (info["returns"]["description"] + " " + (mm.group(2) or "").strip()).strip()
+                    )
+                    i += 1
+            continue
+
+        i += 1
+
+    # Description as the remainder (best-effort)
+    try:
+        rest = doc.splitlines()[1:]
+        info["description"] = "\n".join(rest).strip()
+    except Exception:
+        pass
+    return info
+
+
+@mcp.tool(description="Get detailed metadata for a specific OCI SDK client operation.")
+def get_client_operation_details(
+    client_fqn: Annotated[str, "Fully-qualified client class, e.g. 'oci.core.ComputeClient'"],
+    operation: Annotated[str, "Client method/operation name, e.g. 'list_instances' or 'get_instance'"],
+) -> dict:
+    """
+    Returns a structured description of the client's operation including:
+    - signature and per-parameter details (name, kind, required, default, annotation)
+    - parsed docstring (summary, params, returns) and raw docstring
+    - expected_kwargs (from generated SDK method source, if available)
+    - return type annotation (if available)
+    - source file and line numbers (if available)
+    - pagination support heuristic
+    """
+    try:
+        module_name, class_name = client_fqn.rsplit(".", 1)
+        module = import_module(module_name)
+        cls = getattr(module, class_name)
+        if not inspect.isclass(cls):
+            raise ValueError(f"{client_fqn} is not a class")
+
+        if not hasattr(cls, operation):
+            raise AttributeError(f"Operation '{operation}' not found on client '{client_fqn}'")
+
+        method = getattr(cls, operation)
+        if not (inspect.isfunction(method) or inspect.ismethod(method)):
+            raise AttributeError(f"Attribute '{operation}' on client '{client_fqn}' is not a function/method")
+
+        # Signature and type hints
+        sig = inspect.signature(method)
+        try:
+            from typing import get_type_hints as _get_type_hints
+            type_hints = _get_type_hints(method)
+        except Exception:
+            type_hints = {}
+
+        params_list: List[Dict[str, Any]] = []
+        for name, p in sig.parameters.items():
+            if name == "self":
+                continue
+            ann = type_hints.get(name)
+            if ann is None and p.annotation is not inspect._empty:
+                ann = p.annotation
+            if ann is not None:
+                try:
+                    ann_str = getattr(ann, "__name__", str(ann))
+                except Exception:
+                    ann_str = str(ann)
+            else:
+                ann_str = None
+            default = None if p.default is inspect._empty else repr(p.default)
+            required = p.default is inspect._empty and p.kind not in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            )
+            params_list.append(
+                {
+                    "name": name,
+                    "kind": str(p.kind),
+                    "required": required,
+                    "default": default,
+                    "annotation": ann_str,
+                }
+            )
+
+        # Return annotation
+        ret_ann = None
+        try:
+            ra = type_hints.get("return")
+            if ra is None and sig.return_annotation is not inspect._empty:
+                ra = sig.return_annotation
+            if ra is not None:
+                ret_ann = getattr(ra, "__name__", str(ra))
+        except Exception:
+            ret_ann = None
+
+        # Docstring and parsing
+        try:
+            doc = inspect.getdoc(method) or ""
+        except Exception:
+            doc = ""
+        parsed_doc = _parse_docstring(doc)
+        summary = parsed_doc.get("summary") or (doc.splitlines()[0] if doc else "")
+
+        # Source location
+        try:
+            src_file = inspect.getsourcefile(method)
+            src_lines, start_line = inspect.getsourcelines(method)
+            end_line = start_line + len(src_lines) - 1
+        except Exception:
+            src_file, start_line, end_line = None, None, None
+
+        # expected_kwargs from SDK-generated method body (if present)
+        expected_kwargs = _extract_expected_kwargs_from_source(method)
+
+        # Pagination heuristic
+        supports_pagination = _supports_pagination(method, operation)
+
+        result = {
+            "client": client_fqn,
+            "operation": operation,
+            "signature": str(sig),
+            "parameters": params_list,
+            "expected_kwargs": sorted(expected_kwargs) if isinstance(expected_kwargs, set) else expected_kwargs,
+            "doc": {
+                "summary": summary,
+                "params": parsed_doc.get("params", {}),
+                "returns": parsed_doc.get("returns", {"type": None, "description": ""}),
+                "description": parsed_doc.get("description", ""),
+                "raw": doc,
+            },
+            "return_annotation": ret_ann,
+            "source": {"file": src_file, "line_start": start_line, "line_end": end_line},
+            "supports_pagination": supports_pagination,
+        }
+        logger.info(f"get_client_operation_details success: client={client_fqn} op={operation}")
+        return result
+    except Exception as e:
+        logger.error(f"Error getting operation details for {client_fqn}.{operation}: {e}")
+        return {"client": client_fqn, "operation": operation, "error": str(e)}
 
 
 def main():
