@@ -173,77 +173,121 @@ def _construct_model_from_mapping(
     fqn = mapping.get("__model_fqn") or mapping.get("__class_fqn")
     class_name = mapping.get("__model") or mapping.get("__class")
     clean = {k: v for k, v in mapping.items() if not k.startswith("__")}
-    # derive a parent model prefix hint from candidate classnames
-    # (e.g., 'LaunchInstance' from 'LaunchInstanceDetails')
+
+    # First attempt: resolve a target model class (without coercing nested values),
+    # then let oci.util.from_dict handle nested construction and polymorphic subclasses.
+    resolved_cls = None
+
+    # try explicit FQN first
+    if isinstance(fqn, str):
+        try:
+            mod_name, cls_name = fqn.rsplit(".", 1)
+            mod = import_module(mod_name)
+            cand_cls = getattr(mod, cls_name)
+            if inspect.isclass(cand_cls):
+                resolved_cls = cand_cls
+        except Exception:
+            resolved_cls = None
+
+    # try explicit simple class name within models module
+    if resolved_cls is None and models_module and isinstance(class_name, str):
+        cand_cls = _resolve_model_class(models_module, class_name)
+        if inspect.isclass(cand_cls):
+            resolved_cls = cand_cls
+
+    # try candidates derived from param name
+    if resolved_cls is None and models_module:
+        for cand in candidate_classnames:
+            cand_cls = _resolve_model_class(models_module, cand)
+            if inspect.isclass(cand_cls):
+                resolved_cls = cand_cls
+                break
+
+    if resolved_cls is not None:
+        # filter unknown keys via swagger_types when available,
+        # then rely on from_dict to recursively build nested models and select subclasses via get_subtype
+        filtered_clean = clean
+        try:
+            swagger_types = getattr(resolved_cls, "swagger_types", None)
+            if isinstance(swagger_types, dict):
+                filtered_clean = {k: v for k, v in clean.items() if k in swagger_types}
+        except Exception:
+            filtered_clean = clean
+        try:
+            return oci.util.from_dict(resolved_cls, filtered_clean)
+        except Exception:
+            try:
+                return resolved_cls(**filtered_clean)
+            except Exception:
+                pass
+
+    # If we could not resolve the target class yet, fall back to heuristic coercion for nested values,
+    # then retry candidate resolution on the coerced mapping.
+    # derive a parent model prefix hint from candidate classnames (e.g., 'LaunchInstance' from 'LaunchInstanceDetails')
     parent_prefix_hint: Optional[str] = None
     for cand in candidate_classnames:
         if isinstance(cand, str) and cand:
             if cand.endswith("Details"):
                 parent_prefix_hint = cand[: -len("Details")]
                 break
-            # fallback to whole cand if no 'Details' suffix
             if parent_prefix_hint is None:
                 parent_prefix_hint = cand
-    # recursively coerce nested mappings/lists before attempting construction
-    clean = _coerce_mapping_values(
-        clean, models_module, parent_prefix=parent_prefix_hint
-    )
-    # try explicit FQN first
+
+    coerced_clean = _coerce_mapping_values(clean, models_module, parent_prefix=parent_prefix_hint)
+
+    # Retry FQN
     if isinstance(fqn, str):
         try:
             mod_name, cls_name = fqn.rsplit(".", 1)
             mod = import_module(mod_name)
-            cls = getattr(mod, cls_name)
-            if inspect.isclass(cls):
+            cand_cls = getattr(mod, cls_name)
+            if inspect.isclass(cand_cls):
                 try:
-                    return oci.util.from_dict(cls, clean)
+                    return oci.util.from_dict(cand_cls, coerced_clean)
                 except Exception:
-                    return cls(**clean)
+                    return cand_cls(**coerced_clean)
         except Exception:
             pass
-    # try explicit simple class name within models module
+
+    # Retry simple class name
     if models_module and isinstance(class_name, str):
-        cls = _resolve_model_class(models_module, class_name)
-        if inspect.isclass(cls):
-            # filter unknown keys via swagger_types (when available) before constructing
-            filtered_clean = clean
+        cand_cls = _resolve_model_class(models_module, class_name)
+        if inspect.isclass(cand_cls):
+            filtered_clean = coerced_clean
             try:
-                swagger_types = getattr(cls, "swagger_types", None)
+                swagger_types = getattr(cand_cls, "swagger_types", None)
                 if isinstance(swagger_types, dict):
-                    filtered_clean = {
-                        k: v for k, v in clean.items() if k in swagger_types
-                    }
+                    filtered_clean = {k: v for k, v in coerced_clean.items() if k in swagger_types}
             except Exception:
-                filtered_clean = clean
+                filtered_clean = coerced_clean
             try:
-                return oci.util.from_dict(cls, filtered_clean)
+                return oci.util.from_dict(cand_cls, filtered_clean)
             except Exception:
                 try:
-                    return cls(**filtered_clean)
+                    return cand_cls(**filtered_clean)
                 except Exception:
                     pass
-    # try candidates derived from param name
+
+    # Retry candidate list
     if models_module:
         for cand in candidate_classnames:
-            cls = _resolve_model_class(models_module, cand)
-            if inspect.isclass(cls):
-                # filter unknown keys before constructing (honor swagger_types when present)
-                filtered_clean = clean
+            cand_cls = _resolve_model_class(models_module, cand)
+            if inspect.isclass(cand_cls):
+                filtered_clean = coerced_clean
                 try:
-                    swagger_types = getattr(cls, "swagger_types", None)
+                    swagger_types = getattr(cand_cls, "swagger_types", None)
                     if isinstance(swagger_types, dict):
-                        filtered_clean = {
-                            k: v for k, v in clean.items() if k in swagger_types
-                        }
+                        filtered_clean = {k: v for k, v in coerced_clean.items() if k in swagger_types}
                 except Exception:
-                    filtered_clean = clean
+                    filtered_clean = coerced_clean
                 try:
-                    return oci.util.from_dict(cls, filtered_clean)
+                    return oci.util.from_dict(cand_cls, filtered_clean)
                 except Exception:
                     try:
-                        return cls(**filtered_clean)
+                        return cand_cls(**filtered_clean)
                     except Exception:
                         continue
+
     # fall back to original mapping
     return mapping
 
@@ -534,6 +578,79 @@ def _call_with_pagination_if_applicable(
     return data, opc_request_id
 
 
+def _iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str):
+                yield k
+            yield from _iter_strings(v)
+    elif isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            yield from _iter_strings(item)
+
+
+def _region_from_code(code: str) -> Optional[str]:
+    code = (code or "").lower()
+    mapping = {
+        "iad": "us-ashburn-1",
+        "phx": "us-phoenix-1",
+        "sjc": "us-sanjose-1",
+        "lhr": "uk-london-1",
+        "fra": "eu-frankfurt-1",
+        "ams": "eu-amsterdam-1",
+        "bom": "ap-mumbai-1",
+        "hyd": "ap-hyderabad-1",
+        "nrt": "ap-tokyo-1",
+        "icn": "ap-seoul-1",
+        "yny": "ap-chuncheon-1",
+        "mel": "ap-melbourne-1",
+        "syd": "ap-sydney-1",
+        "gru": "sa-saopaulo-1",
+        "scl": "sa-santiago-1",
+        "jed": "me-jeddah-1",
+        "auh": "me-abudhabi-1",
+        "zrh": "eu-zurich-1",
+        "cdg": "eu-paris-1",
+        "mad": "eu-madrid-1",
+    }
+    return mapping.get(code)
+
+
+def _infer_region_from_params(params: Dict[str, Any]) -> Optional[str]:
+    # 1) Look for region code embedded in OCIDs like 'oc1.<regioncode>.' e.g., '.iad.'
+    for s in _iter_strings(params):
+        m = re.search(r"\.([a-z]{3})\.", s)
+        if m:
+            region = _region_from_code(m.group(1))
+            if region:
+                return region
+    # 2) Look for availability domain names e.g., 'US-ASHBURN-AD-1'
+    ad = params.get("availability_domain")
+    if isinstance(ad, str):
+        up = ad.upper()
+        if "ASHBURN" in up:
+            return "us-ashburn-1"
+        if "PHOENIX" in up:
+            return "us-phoenix-1"
+        if "SANJOSE" in up or "SAN JOSE" in up:
+            return "us-sanjose-1"
+    return None
+
+
+def _maybe_set_client_region(client: Any, params: Dict[str, Any]) -> None:
+    try:
+        region = _infer_region_from_params(params or {})
+        if region:
+            base = getattr(client, "base_client", None)
+            if base and hasattr(base, "set_region"):
+                base.set_region(region)
+    except Exception:
+        # best-effort only
+        pass
+
+
 @mcp.tool(description="Invoke an OCI Python SDK API via client and operation name.")
 def invoke_oci_api(
     client_fqn: Annotated[
@@ -555,6 +672,11 @@ def invoke_oci_api(
     """
     try:
         client = _import_client(client_fqn)
+        # Best-effort: set client region based on hints in params (OCIDs or availability domain)
+        try:
+            _maybe_set_client_region(client, params or {})
+        except Exception:
+            pass
         if not hasattr(client, operation):
             raise AttributeError(
                 f"Operation '{operation}' not found on client '{client_fqn}'"
