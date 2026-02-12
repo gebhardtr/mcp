@@ -495,7 +495,7 @@ class TestIdentityTools:
 
     @pytest.mark.asyncio
     @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
-    async def test_get_compartment_by_name(self, mock_get_client):
+    async def test_get_compartments_by_name(self, mock_get_client):
         """
         Tests finding a compartment by name, including simulating pagination
         where the target is on the second page.
@@ -527,7 +527,7 @@ class TestIdentityTools:
         async with Client(mcp) as client:
             raw_content = (
                 await client.call_tool(
-                    "get_compartment_by_name",
+                    "get_compartments_by_name",
                     {
                         "name": "TargetComp",
                         "parent_compartment_id": "test_parent_id",
@@ -535,19 +535,19 @@ class TestIdentityTools:
                 )
             ).structured_content
 
-            if "result" in raw_content:
-                result = raw_content["result"]
-            else:
-                result = raw_content
+            # Depending on FastMCP version, result may be nested
+            result = raw_content.get("result", raw_content)
 
-            assert result["id"] == "target_id"
-            assert result["name"] == "TargetComp"
+            assert isinstance(result, list)
+            assert len(result) == 1
+            assert result[0]["id"] == "target_id"
+            assert result[0]["name"] == "TargetComp"
 
             assert mock_client.list_compartments.call_count == 2
 
     @pytest.mark.asyncio
     @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
-    async def test_get_compartment_by_name_not_found(self, mock_get_client):
+    async def test_get_compartments_by_name_not_found(self, mock_get_client):
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -560,7 +560,7 @@ class TestIdentityTools:
         async with Client(mcp) as client:
             raw_content = (
                 await client.call_tool(
-                    "get_compartment_by_name",
+                    "get_compartments_by_name",
                     {
                         "name": "Missing",
                         "parent_compartment_id": "ocid1.tenancy",
@@ -570,7 +570,120 @@ class TestIdentityTools:
 
             # Depending on FastMCP version, result may be nested
             result = raw_content.get("result", raw_content)
-            assert result is None
+            assert isinstance(result, list)
+            assert len(result) == 0
+
+    @pytest.mark.asyncio
+    @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
+    async def test_get_compartments_by_name_multiple_matches(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        # Page 1 with one match and one non-match
+        p1 = create_autospec(oci.response.Response)
+        p1.data = [
+            oci.identity.models.Compartment(name="Target", id="t1"),
+            oci.identity.models.Compartment(name="Other", id="o1"),
+        ]
+        p1.has_next_page = True
+        p1.next_page = "p2"
+
+        # Page 2 with another match
+        p2 = create_autospec(oci.response.Response)
+        p2.data = [oci.identity.models.Compartment(name="Target", id="t2")]
+        p2.has_next_page = False
+        p2.next_page = None
+
+        mock_client.list_compartments.side_effect = [p1, p2]
+
+        async with Client(mcp) as client:
+            result = (
+                await client.call_tool(
+                    "get_compartments_by_name",
+                    {
+                        "name": "Target",
+                        "parent_compartment_id": "ocid1.tenancy",
+                    },
+                )
+            ).structured_content.get("result")
+
+            assert isinstance(result, list)
+            assert [r["id"] for r in result] == ["t1", "t2"]
+
+    @pytest.mark.asyncio
+    @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
+    async def test_get_compartments_by_name_with_flags(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        resp = create_autospec(oci.response.Response)
+        resp.data = []
+        resp.has_next_page = False
+        resp.next_page = None
+        mock_client.list_compartments.return_value = resp
+
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "get_compartments_by_name",
+                {
+                    "name": "Anything",
+                    "parent_compartment_id": "ocid1.tenancy",
+                    "compartment_id_in_subtree": True,
+                    "access_level": "ANY",
+                    "lifecycle_state": "ACTIVE",
+                },
+            )
+
+        # Ensure flags are propagated to SDK call
+        kwargs = mock_client.list_compartments.call_args.kwargs
+        assert kwargs["compartment_id_in_subtree"] is True
+        assert kwargs["access_level"] == "ANY"
+        assert kwargs["lifecycle_state"] == "ACTIVE"
+
+    @pytest.mark.asyncio
+    @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
+    async def test_get_compartments_by_name_exception_propagates(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_client.list_compartments.side_effect = RuntimeError("kaboom")
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "get_compartments_by_name",
+                    {
+                        "name": "X",
+                        "parent_compartment_id": "ocid1.tenancy",
+                    },
+                )
+
+    @pytest.mark.asyncio
+    @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
+    async def test_list_subscribed_regions_exception_propagates(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_client.list_region_subscriptions.side_effect = ValueError("nope")
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "list_subscribed_regions",
+                    {"tenancy_id": "ocid1.tenancy"},
+                )
+
+    @pytest.mark.asyncio
+    @patch("oracle.oci_identity_mcp_server.server.get_identity_client")
+    async def test_create_auth_token_exception_propagates(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_client.create_auth_token.side_effect = Exception("bad")
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "create_auth_token",
+                    {"user_id": "ocid1.user"},
+                )
 
     @pytest.mark.asyncio
     @patch("oracle.oci_identity_mcp_server.server.get_identity_client")

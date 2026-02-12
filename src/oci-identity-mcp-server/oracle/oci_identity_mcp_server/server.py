@@ -268,20 +268,46 @@ def get_current_user() -> User:
 
 
 @mcp.tool(
-    description="Get a specific compartment by its name within a parent compartment."
+    description=(
+        "Find compartments by name within a parent compartment and return all matches. "
+        "Optionally search the entire subtree (tenancy) using compartment_id_in_subtree."
+    )
 )
-def get_compartment_by_name(
-    name: str = Field(description="The name of the compartment to find."),
+def get_compartments_by_name(
+    name: str = Field(
+        description="The name of the compartment(s) to match (exact match)."
+    ),
     parent_compartment_id: str = Field(
         description="The OCID of the parent compartment to search within (or tenancy OCID).",
     ),
-) -> Optional[Compartment]:
+    compartment_id_in_subtree: Optional[bool] = Field(
+        False,
+        description=(
+            "When true and parent is the tenancy (root), traverse all subcompartments."
+        ),
+    ),
+    access_level: Optional[Literal["ANY", "ACCESSIBLE"]] = Field(
+        "ACCESSIBLE",
+        description=(
+            "Setting to ACCESSIBLE returns only those compartments for which the user has INSPECT permissions."
+        ),
+    ),
+    lifecycle_state: Optional[
+        Literal["CREATING", "ACTIVE", "INACTIVE", "DELETING", "DELETED", "FAILED"]
+    ] = Field(
+        "ACTIVE",
+        description="Filter compartments by lifecycle state (default ACTIVE).",
+    ),
+) -> list[Compartment]:
     """
-    Searches for a compartment by name within a specific parent compartment.
-    Note: This is not a recursive search; it only looks at direct children.
+    Return all compartments whose name exactly matches the provided name within
+    the specified parent compartment. If compartment_id_in_subtree is True and
+    the parent is the tenancy (root), the entire subtree is searched.
     """
     try:
         client = get_identity_client()
+
+        results: list[Compartment] = []
 
         has_next_page = True
         next_page: str = None
@@ -290,25 +316,23 @@ def get_compartment_by_name(
             response = client.list_compartments(
                 compartment_id=parent_compartment_id,
                 page=next_page,
-                access_level="ACCESSIBLE",
-                lifecycle_state="ACTIVE",
+                access_level=access_level,
+                lifecycle_state=lifecycle_state,
+                compartment_id_in_subtree=compartment_id_in_subtree,
             )
 
             for cmp in response.data:
-                if cmp.name == name:
-                    logger.info(f"Found compartment: {name}")
-                    return map_compartment(cmp)
+                if getattr(cmp, "name", None) == name:
+                    results.append(map_compartment(cmp))
 
             has_next_page = response.has_next_page
             next_page = response.next_page if hasattr(response, "next_page") else None
 
-        logger.warning(
-            f"Compartment '{name}' not found in parent '{parent_compartment_id}'"
-        )
-        return None
+        logger.info(f"Found {len(results)} matching compartments for name '{name}'")
+        return results
 
     except Exception as e:
-        logger.error(f"Error in get_compartment_by_name tool: {str(e)}")
+        logger.error(f"Error in get_compartments_by_name tool: {str(e)}")
         raise e
 
 
