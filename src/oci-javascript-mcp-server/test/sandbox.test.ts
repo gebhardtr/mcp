@@ -6,8 +6,287 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runJavaScript } from "../src/sandbox.ts";
-import type { HostRpcRequest } from "../src/types.ts";
+import { fileURLToPath } from "node:url";
+import { PodmanIsolationProvider } from "../src/isolation/podman.ts";
+import { runJavaScript as runJavaScriptWithProvider } from "../src/sandbox.ts";
+import type {
+  HostRpcRequest,
+  IsolationProvider,
+  IsolationRunOptions,
+  OciReflectionManifest,
+  SandboxResult
+} from "../src/types.ts";
+
+const TEST_PODMAN_PROVIDER = new PodmanIsolationProvider({
+  cliPath: fileURLToPath(new URL("./fake-podman.ts", import.meta.url)),
+  image: "test-runner:dev"
+});
+
+type RunOptions = Parameters<typeof runJavaScriptWithProvider>[1];
+type TestRunOptions = Omit<RunOptions, "isolationProvider"> & {
+  isolationProvider?: IsolationProvider;
+};
+
+function runJavaScript(code: string, options: TestRunOptions): Promise<SandboxResult> {
+  return runJavaScriptWithProvider(code, {
+    ...options,
+    isolationProvider: options.isolationProvider ?? TEST_PODMAN_PROVIDER
+  });
+}
+
+function testProvider(run: IsolationProvider["run"]): IsolationProvider {
+  return { run };
+}
+
+test("Podman provider rejects unsafe executable and image inputs", () => {
+  assert.throws(() => new PodmanIsolationProvider({ cliPath: "" }), /CLI path is invalid/);
+  assert.throws(
+    () => new PodmanIsolationProvider({ image: "--privileged" }),
+    /image is invalid/
+  );
+});
+
+test("sandbox delegates execution through the selected isolation provider", async () => {
+  const expected: SandboxResult = {
+    result: 42,
+    error: null,
+    stdout: "",
+    stderr: "",
+    exitCode: 0,
+    timedOut: false
+  };
+  const reflectionManifest: OciReflectionManifest = { services: {} };
+  const hostRpc = async () => null;
+  const calls: Array<{ code: string; options: IsolationRunOptions }> = [];
+  let terminated = false;
+  const provider = testProvider((code, options) => {
+    calls.push({ code, options });
+    return {
+      result: Promise.resolve(expected),
+      async terminate() {
+        terminated = true;
+      }
+    };
+  });
+
+  const result = await runJavaScript("40 + 2;", {
+    timeoutSeconds: 10,
+    hostRpc,
+    reflectionManifest,
+    isolationProvider: provider
+  });
+
+  assert.deepEqual(result, expected);
+  assert.equal(terminated, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].code, "40 + 2;");
+  assert.equal(calls[0].options.reflectionManifest, reflectionManifest);
+  assert.notEqual(calls[0].options.hostRpc, hostRpc);
+  assert.equal(calls[0].options.signal.aborted, true);
+  assert(calls[0].options.deadlineMs > Date.now());
+});
+
+test("sandbox enforces the OCI call budget above isolation providers", async () => {
+  let hostCalls = 0;
+  const request: HostRpcRequest = {
+    binding: "oracle",
+    namespace: "oci",
+    operation: "config",
+    payload: {}
+  };
+  const provider = testProvider((_code, options) => ({
+    result: (async (): Promise<SandboxResult> => {
+      let finalRpcResult = null;
+      for (let index = 0; index < 101; index += 1) {
+        finalRpcResult = await options.hostRpc(request);
+      }
+      return {
+        result: finalRpcResult,
+        error: null,
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false
+      };
+    })(),
+    async terminate() {}
+  }));
+
+  const result = await runJavaScript("0;", {
+    timeoutSeconds: 10,
+    hostRpc: async () => {
+      hostCalls += 1;
+      return {};
+    },
+    isolationProvider: provider
+  });
+
+  assert.equal(hostCalls, 100);
+  assert.deepEqual(result.result, {
+    ok: false,
+    error: "OCI call limit exceeded (100)"
+  });
+});
+
+test("sandbox rejects invalid OCI requests above isolation providers", async () => {
+  let hostCalls = 0;
+  const provider = testProvider((_code, options) => ({
+    result: options.hostRpc({ operation: "invoke" }).then(rpcResult => ({
+      result: rpcResult,
+      error: null,
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false
+    })),
+    async terminate() {}
+  }));
+
+  const result = await runJavaScript("0;", {
+    hostRpc: async () => {
+      hostCalls += 1;
+      return {};
+    },
+    isolationProvider: provider
+  });
+
+  assert.equal(hostCalls, 0);
+  assert.deepEqual(result.result, {
+    ok: false,
+    error: "invalid OCI bridge request"
+  });
+});
+
+test("sandbox aborts and terminates an isolation provider at the deadline", async () => {
+  let signal: AbortSignal | undefined;
+  let terminateCalls = 0;
+  const provider = testProvider((_code, options) => {
+    signal = options.signal;
+    return {
+      result: new Promise(() => undefined),
+      async terminate() {
+        terminateCalls += 1;
+      }
+    };
+  });
+
+  const startedAt = Date.now();
+  const result = await runJavaScript("while (true) {}", {
+    timeoutSeconds: 1,
+    hostRpc: async () => null,
+    isolationProvider: provider
+  });
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.exitCode, -1);
+  assert.equal(signal?.aborted, true);
+  assert.equal(terminateCalls, 1);
+  assert(Date.now() - startedAt < 5000);
+});
+
+test("sandbox rejects oversized results returned by an isolation provider", async () => {
+  const provider = testProvider(() => ({
+    result: Promise.resolve({
+      result: "x".repeat(1024 * 1024),
+      error: null,
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false
+    }),
+    async terminate() {}
+  }));
+
+  const result = await runJavaScript("0;", {
+    hostRpc: async () => null,
+    isolationProvider: provider
+  });
+
+  assert.equal(result.result, null);
+  assert.equal(result.exitCode, 1);
+  assert.match(
+    result.error?.message ?? "",
+    /isolation provider returned an invalid result: result was .* exceeding limit 1048576 bytes/
+  );
+});
+
+test("sandbox rejects malformed isolation provider results", async () => {
+  const provider = testProvider(() => ({
+    result: Promise.resolve({
+      result: Number.NaN,
+      error: null,
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false
+    }),
+    async terminate() {}
+  }));
+
+  const result = await runJavaScript("0;", {
+    hostRpc: async () => null,
+    isolationProvider: provider
+  });
+
+  assert.equal(result.result, null);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.error?.message ?? "", /result must be JSON-compatible/);
+});
+
+test("sandbox reports isolation provider cleanup failures", async () => {
+  const provider = testProvider(() => ({
+    result: Promise.resolve({
+      result: 42,
+      error: null,
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false
+    }),
+    async terminate() {
+      throw new Error("cleanup broke");
+    }
+  }));
+
+  const result = await runJavaScript("40 + 2;", {
+    hostRpc: async () => null,
+    isolationProvider: provider
+  });
+
+  assert.equal(result.result, null);
+  assert.equal(result.exitCode, 1);
+  assert.match(
+    result.error?.message ?? "",
+    /isolation provider cleanup failed: cleanup broke/
+  );
+});
+
+test("sandbox does not hide cleanup failures behind a timeout result", async () => {
+  const provider = testProvider(() => ({
+    result: Promise.resolve({
+      result: null,
+      error: { message: "sandbox run deadline exceeded" },
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      timedOut: true
+    }),
+    async terminate() {
+      throw new Error("cleanup broke after timeout");
+    }
+  }));
+
+  const result = await runJavaScript("0;", {
+    hostRpc: async () => null,
+    isolationProvider: provider
+  });
+
+  assert.equal(result.timedOut, false);
+  assert.match(
+    result.error?.message ?? "",
+    /isolation provider cleanup failed: cleanup broke after timeout/
+  );
+});
 
 test("sandbox runs JavaScript and calls host OCI RPC", async () => {
   const requests: HostRpcRequest[] = [];
@@ -202,6 +481,21 @@ test("sandbox returns a trailing expression as structured result", async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.stderr, "");
   assert.equal(result.result, 42);
+});
+
+test("sandbox rejects oversized structured results before parent IPC", async () => {
+  const result = await runJavaScript(
+    `"x".repeat(1024 * 1024);`,
+    {
+      timeoutSeconds: 10,
+      hostRpc: async () => null
+    }
+  );
+
+  assert.equal(result.result, null);
+  assert.match(result.error?.message ?? "", /exceeding result limit 1048576 bytes/);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.timedOut, false);
 });
 
 test("sandbox infers a trailing expression when helper functions use return", async () => {
@@ -806,6 +1100,7 @@ test("sandbox OCI bridge does not depend on user-mutated globals", async () => {
     globalThis.Set = null;
     globalThis.Error = null;
     globalThis.Proxy = null;
+    globalThis.Promise = null;
 
     const response = await oci.core.ComputeClient.listInstances({
       compartmentId: "ocid1.compartment"
@@ -900,11 +1195,54 @@ test("sandbox caps request serialization depth", async () => {
 });
 
 test("sandbox rejects non-finite timeout values", async () => {
+  let providerCalls = 0;
+  const provider = testProvider(() => {
+    providerCalls += 1;
+    throw new Error("provider must not run");
+  });
   await assert.rejects(
     runJavaScript("console.log('nope');", {
       timeoutSeconds: Number.NaN,
-      hostRpc: async () => null
+      hostRpc: async () => null,
+      isolationProvider: provider
     }),
     /timeout must be a finite number/
   );
+  assert.equal(providerCalls, 0);
+});
+
+test("sandbox rejects oversized source before spawning a worker", async () => {
+  await assert.rejects(
+    runJavaScript("x".repeat(1024 * 1024 + 1), {
+      hostRpc: async () => null
+    }),
+    /JavaScript code exceeds 1048576 bytes/
+  );
+});
+
+test("sandbox caps the total number of OCI calls", async () => {
+  let hostCalls = 0;
+  const result = await runJavaScript(
+    `
+    let message = "";
+    for (let index = 0; index < 101; index += 1) {
+      try {
+        await oci.core.ComputeClient.listInstances({ compartmentId: "ocid1.compartment" });
+      } catch (error) {
+        message = error.message;
+      }
+    }
+    message;
+    `,
+    {
+      timeoutSeconds: 10,
+      hostRpc: async () => {
+        hostCalls += 1;
+        return { items: [] };
+      }
+    }
+  );
+
+  assert.equal(hostCalls, 100);
+  assert.match(String(result.result), /OCI call limit exceeded \(100\)/);
 });

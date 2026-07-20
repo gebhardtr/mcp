@@ -13,7 +13,7 @@ const __hostRpc = $2;
 const __ociReflectionManifest = $3 || { services: {} };
 const __ociWireTypeKey = "__oci_wire_type";
 const __ociBase64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const __ociMaxDepth = 80;
+const __ociMaxDepth = 24;
 const __arrayFrom = Array.from;
 const __arrayIsArray = Array.isArray;
 const __bigInt = BigInt;
@@ -32,6 +32,7 @@ const __objectEntries = Object.entries;
 const __objectFreeze = Object.freeze;
 const __objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const __objectKeys = Object.keys;
+const __promise = Promise;
 const __promiseAllSettled = Promise.allSettled.bind(Promise);
 const __proxy = Proxy;
 const __reflectOwnKeys = Reflect.ownKeys;
@@ -252,9 +253,14 @@ async function __ociRpc(operation, payload) {
     operation,
     payload
   });
-  const promise = __hostRpc.apply(undefined, [request], {
-    arguments: { copy: true },
-    result: { promise: true, copy: true }
+  const promise = new __promise((resolve, reject) => {
+    try {
+      __hostRpc.applyIgnored(undefined, [request, resolve], {
+        arguments: { reference: true }
+      });
+    } catch (error) {
+      reject(error);
+    }
   });
   __ociRpcPending.add(promise);
   try {

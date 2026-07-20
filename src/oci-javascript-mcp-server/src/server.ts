@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { PodmanIsolationProvider } from "./isolation/podman.ts";
 import { createOciReflectionManifest, createOciSdkHostRpc } from "./oci-host.ts";
 import { runJavaScript } from "./sandbox.ts";
 import type { JsonObject } from "./types.ts";
@@ -18,6 +19,10 @@ const MAX_CONCURRENT_TOOL_CALLS = positiveIntegerEnv(
   4
 );
 const MAX_QUEUED_TOOL_CALLS = positiveIntegerEnv("OCI_JAVASCRIPT_MAX_QUEUED_TOOL_CALLS", 64);
+const isolationProvider = new PodmanIsolationProvider({
+  cliPath: process.env.OCI_JAVASCRIPT_PODMAN_CLI,
+  image: process.env.OCI_JAVASCRIPT_PODMAN_IMAGE
+});
 const hostRpc = createOciSdkHostRpc();
 let reflectionManifest: ReturnType<typeof createOciReflectionManifest> | undefined;
 const DEFAULT_TIMEOUT_SECONDS = 30;
@@ -72,7 +77,8 @@ server.registerTool(
       const result = await runJavaScript(args.code, {
         timeoutSeconds: args.timeout,
         hostRpc,
-        reflectionManifest
+        reflectionManifest,
+        isolationProvider
       });
       return {
         result: result.result,

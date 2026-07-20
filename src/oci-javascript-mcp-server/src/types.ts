@@ -63,3 +63,22 @@ export type OciDiscoverPayload = {
   client?: string;
   operation?: string;
 };
+
+export type IsolationHostRpc = (request: unknown) => Promise<Json>;
+
+export type IsolationRunOptions = {
+  deadlineMs: number;
+  signal: AbortSignal;
+  hostRpc: IsolationHostRpc;
+  reflectionManifest?: OciReflectionManifest;
+};
+
+export interface IsolationExecution {
+  readonly result: Promise<unknown>;
+  /** Idempotently stop execution and resolve after provider resources are released. */
+  terminate(): Promise<void>;
+}
+
+export interface IsolationProvider {
+  run(code: string, options: IsolationRunOptions): IsolationExecution;
+}

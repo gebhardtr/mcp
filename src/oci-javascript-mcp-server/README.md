@@ -1,112 +1,31 @@
 # OCI JavaScript MCP Server
 
-`oci-javascript-mcp-server` lets an MCP client run agent-authored JavaScript that calls OCI through a trusted host bridge.
+`oci-javascript-mcp-server` runs agent-authored JavaScript that calls OCI
+through a trusted host bridge. The sandbox receives an SDK-like `oci` binding,
+but never receives OCI credentials, the real SDK, Node built-ins, filesystem
+access, environment variables, or a network API.
 
-Sandboxed JavaScript runs inside a V8 isolate with no OCI credentials, no inherited environment, no Node built-ins, no filesystem access, and no network API. OCI calls are made through a narrow host RPC binding to the trusted server process, which loads the Oracle `oci-sdk` package and host OCI config.
+> **Security:** Podman is the only implemented isolation provider. On Linux, a
+> normal Podman container shares the host kernel and is not a VM boundary. The
+> deployment is responsible for selecting a Podman backend and surrounding
+> controls appropriate to its threat model; the MCP server does not perform
+> provider admission.
 
-## Architecture
+## Quick start
 
-```mermaid
-flowchart LR
-  client["MCP client / model"]
-  server["oci-javascript-mcp-server"]
+Requires Node.js 26 or newer, Podman, and an OCI SDK configuration. A native
+build toolchain is also needed when installing `isolated-vm` on the host.
 
-  subgraph sandbox["Untrusted V8 isolate"]
-    js["Agent-authored JavaScript"]
-    proxy["Injected oci proxy"]
-    manifest["Reflection manifest"]
-  end
-
-  subgraph host["Trusted host process"]
-    rpc["Host RPC validator"]
-    sdk["OCI SDK clients"]
-    auth["OCI config / session auth"]
-  end
-
-  oci["OCI APIs"]
-
-  client -->|"run_javascript(code)"| server
-  server -->|"fresh isolate + manifest"| js
-  js --> proxy
-  proxy -->|"invoke { service, client, operation, request }"| rpc
-  rpc -->|"validated call"| sdk
-  auth --> sdk
-  sdk -->|"signed HTTPS request"| oci
-  oci --> sdk
-  sdk -->|"sanitized JSON response"| rpc
-  rpc --> proxy
-  js -->|"final expression result"| server
-  server --> client
-
-  manifest -. "services, clients, operations only" .-> proxy
-```
-
-Conceptually, the model writes ordinary JavaScript, but that JavaScript runs in
-a locked-down V8 isolate that cannot see files, environment variables, network
-APIs, credentials, or the real OCI SDK. The key breakthrough is the narrow RPC
-bridge: sandbox code can only send structured OCI operation requests to the
-trusted host process, and the host validates, signs, executes, sanitizes, and
-returns JSON results without ever handing credentials into the sandbox.
-
-## Request Flow
-
-```mermaid
-sequenceDiagram
-  participant Client as MCP client
-  participant Server as MCP server
-  participant Isolate as Fresh V8 isolate
-  participant Proxy as Injected oci proxy
-  participant Host as Host RPC validator
-  participant SDK as OCI SDK client
-  participant OCI as OCI APIs
-
-  Client->>Server: run_javascript(code)
-  Server->>Isolate: create isolate and install prelude
-  Server->>Isolate: run code with timeout and limits
-  Isolate->>Proxy: call oci service/client operation
-  Proxy->>Host: send structured invoke request
-  Host->>Host: validate service, client, operation, request
-  Host->>SDK: create client with host OCI auth
-  SDK->>OCI: signed HTTPS request
-  OCI-->>SDK: OCI response
-  SDK-->>Host: SDK response object
-  Host-->>Proxy: sanitized JSON result
-  Proxy-->>Isolate: resolve awaited OCI call
-  Isolate-->>Server: final expression result or error, logs
-  Server-->>Client: MCP tool result
-```
-
-## Install
-
-For local development from this package directory:
+From this directory:
 
 ```bash
 npm install
+npm run podman:build
 npm start
 ```
 
-After the package is published, install it as a command:
-
-```bash
-npm install -g oci-javascript-mcp-server
-oci-javascript-mcp-server
-```
-
-This implementation requires Node 26 or newer. The server implementation uses Node's built-in TypeScript stripping, and `isolated-vm` requires Node to run with `--no-node-snapshot`. Installing `isolated-vm` uses a native package install step; environments that require explicit npm script approval must allow that install script or provide the native build toolchain it needs.
-
-## Invoke
-
-The server speaks MCP over stdio using the official MCP TypeScript SDK. For
-manual local development, run it from this directory:
-
-```bash
-node --no-node-snapshot --experimental-strip-types src/server.ts
-```
-
-For an MCP client, prefer invoking `node` directly instead of `npm start` so
-npm's lifecycle output does not interfere with stdio JSON-RPC messages.
-
-Local checkout:
+The server uses MCP over stdio. For an MCP client, invoke Node directly so npm
+lifecycle output cannot interfere with JSON-RPC:
 
 ```json
 {
@@ -117,7 +36,7 @@ Local checkout:
       "args": [
         "--no-node-snapshot",
         "--experimental-strip-types",
-        "<absolute path to this repo>/src/oci-javascript-mcp-server/src/server.ts"
+        "<repo>/src/oci-javascript-mcp-server/src/server.ts"
       ],
       "env": {
         "OCI_CONFIG_PROFILE": "<profile_name>"
@@ -127,127 +46,103 @@ Local checkout:
 }
 ```
 
-Globally installed package:
-
-```json
-{
-  "mcpServers": {
-    "oci-javascript-mcp-server": {
-      "type": "stdio",
-      "command": "oci-javascript-mcp-server",
-      "env": {
-        "OCI_CONFIG_PROFILE": "<profile_name>"
-      }
-    }
-  }
-}
-```
-
-The server reads OCI credentials from the host process using the standard OCI
-config file. Set `OCI_CONFIG_FILE` or `OCI_CONFIG_PROFILE` in the client
-environment when you need a non-default config path or profile.
+Set `OCI_CONFIG_FILE` or `OCI_CONFIG_PROFILE` when the default OCI configuration
+is not appropriate. The default runner image is
+`localhost/oci-javascript-mcp-runner:dev`; override it with
+`OCI_JAVASCRIPT_PODMAN_IMAGE`. `OCI_JAVASCRIPT_PODMAN_CLI` may specify a
+nonstandard Podman executable path. The provider invokes the CLI directly with
+fixed arguments and never through a shell. There is no process fallback.
 
 ## Tools
 
 ### `run_javascript`
 
-Primary tool for OCI tasks. The agent writes one complete JavaScript script and
-uses the injected `oci` binding. The script's final expression is returned as
-structured `result`. `console.log` is available for incidental debugging. Scripts that only log or
-perform side effects can end with a statement whose value is `undefined`; their
-structured `result` will be `null`.
+Runs `code` with an optional timeout of 1–120 seconds (default 30). The final
+expression becomes `result`; logs, errors, exit status, and timeout state are
+returned separately.
 
-Uncaught JavaScript or OCI errors are returned as structured `error` values.
-`stdout` and `stderr` are reserved for logs written by the script.
-
-Treat this like normal code execution: write and run straightforward JavaScript
-first. Use `discover_oci` only after an SDK shape error or when the service,
-client, operation, or request/model shape is genuinely unclear.
+Use the injected binding like the OCI JavaScript SDK:
 
 ```js
 const config = await oci.config();
 const response = await oci.identity.IdentityClient.listRegionSubscriptions({
-  tenancyId: config.tenancyId,
-  limit: 50
+  tenancyId: config.tenancyId
 });
-
-response.items.map(region => region.regionName);
+response.items.map(item => item.regionName);
 ```
 
-Client construction works too:
+Static operations, constructed clients, per-client `region`, SDK pagination
+fields, and shallow `Object.keys` reflection are supported. Only API operations
+backed by SDK request types are exposed; arbitrary endpoints, credentials,
+signers, retry configuration, pagination helpers, and local utilities are not.
 
-```js
-const compute = new oci.core.ComputeClient();
-const instances = await compute.listInstances({
-  compartmentId,
-  limit: 50
-});
-instances.items.map(instance => ({
-  name: instance.displayName,
-  shape: instance.shape,
-  state: instance.lifecycleState
-}));
-```
-
-For multi-page list operations, use the OCI SDK request and response fields
-directly: pass `limit`, then pass `response.opcNextPage` as `page` on the next
-request.
-
-```js
-const compute = new oci.core.ComputeClient();
-const instances = [];
-let page;
-
-do {
-  const request = { compartmentId, limit: 100, ...(page ? { page } : {}) };
-  const response = await compute.listInstances(request);
-  instances.push(...response.items);
-  page = response.opcNextPage;
-} while (page);
-
-instances.map(instance => instance.displayName);
-```
-
-Pass `region` as a client initialization option when a script needs to work
-across multiple OCI regions. Region selection is per client instance and does
-not mutate the configured default region:
-
-```js
-const iadCompute = new oci.core.ComputeClient({ region: "us-ashburn-1" });
-const phxCompute = new oci.core.ComputeClient({ region: "us-phoenix-1" });
-
-const [iadInstances, phxInstances] = await Promise.all([
-  iadCompute.listInstances({ compartmentId, limit: 50 }),
-  phxCompute.listInstances({ compartmentId, limit: 50 })
-]);
-
-({
-  "us-ashburn-1": iadInstances.items.length,
-  "us-phoenix-1": phxInstances.items.length
-});
-```
-
-The injected OCI surface is reflective. Normal JavaScript introspection works
-for the shallow SDK shape:
-
-```js
-Object.keys(oci);                         // services plus config
-Object.keys(oci.core);                    // clients
-Object.keys(oci.core.ComputeClient());    // operations
-"listInstances" in oci.core.ComputeClient();
-```
-
-Reflection is generated from the host's installed `oci-sdk` package and passed
-to the sandbox as plain metadata. The real SDK, credentials, signer, and network
-stack stay in the trusted host process. Only OCI API operations with SDK request
-types are callable through the bridge; local SDK helper methods are not exposed.
+Structured results are limited to 1 MiB by default. Set
+`OCI_JAVASCRIPT_MAX_RESULT_BYTES` to a positive byte count to change the limit;
+the bounded bridge clamps it below the 2 MiB frame ceiling.
 
 ### `discover_oci`
 
-Fallback SDK introspection. Do not call this by default. Use it after a JavaScript attempt fails or when the agent genuinely needs to inspect available services, client names, operation names, or request/model fields.
+Inspects available OCI services, clients, operations, and request/model fields.
+Use it when a normal JavaScript attempt fails because the SDK shape is unclear,
+not as the default way to call OCI.
 
-## Security Model
+## Architecture
 
-The server process is trusted and owns OCI credentials. The sandboxed V8 isolate is untrusted and receives only `console` and the generated OCI binding. It cannot import Node modules and has no direct network or filesystem capability.
+```text
+MCP client
+  -> trusted stdio server
+       -> OCI broker -> OCI SDK + host credentials -> OCI APIs
+       -> Podman isolation provider
+            -> locked-down, credential-free container
+                 -> fresh Node worker
+                      -> isolated-vm V8 isolate
+                           -> user JavaScript + injected oci proxy
+                 <-> bounded framed pipe <-> OCI broker
+```
 
-This is still a single-process sandbox. For production hardening against V8 or native-addon failures, run the server with an outer container or microVM boundary and a conservative network policy.
+The host owns credentials, OCI clients, validation, deadlines, budgets, result
+sanitization, policy enforcement, and teardown. The container and isolate
+receive reflection metadata and a narrow RPC bridge, but no credential or
+signer. The `IsolationProvider` seam keeps these host controls independent of
+the runtime backend.
+
+## Security model
+
+- Every call receives a fresh locked-down container, worker, and isolate.
+- Podman runs with no network, a read-only root filesystem, no capabilities,
+  `no-new-privileges`, a non-root user, and CPU, memory, process, file, and
+  temporary-filesystem limits.
+- Sandbox code cannot import Node modules or directly access files or networks.
+- Credentials, signers, SDK clients, and HTTPS remain in the trusted host.
+- The host validates each request and enforces deadlines, message and result
+  sizes, call counts, concurrency, cancellation, and teardown.
+
+The nested `isolated-vm` boundary reduces exposure inside the runner, but an
+`isolated-vm`, V8, native-addon, container-runtime, or shared-kernel compromise
+can cross a shared-kernel container boundary. Deployments requiring a VM-grade
+boundary must supply that boundary outside the MCP server and retain
+conservative mounts and network policy.
+
+## Development
+
+```bash
+npm test         # unit and MCP stdio integration tests
+npm run coverage # subprocess-aware coverage; 90% line minimum
+npm run check    # TypeScript validation
+npm run ci       # coverage, type checking, and package verification
+```
+
+Tests use a fake Podman control plane to validate the exact hardened CLI
+arguments and exercise the framed worker protocol without requiring Podman in
+CI. They test this server's command construction, not Podman itself.
+
+The generated sandbox prelude and type-only declarations are excluded from
+source-line instrumentation; their behavior is exercised through integration
+tests.
+
+## License
+
+Copyright (c) 2026 Oracle and/or its affiliates.
+
+Released under the Universal Permissive License v1.0 as shown in
+[LICENSE.txt](LICENSE.txt).

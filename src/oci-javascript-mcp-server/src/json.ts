@@ -7,7 +7,7 @@
 import type { Json } from "./types.ts";
 
 const WIRE_TYPE_KEY = "__oci_wire_type";
-const MAX_DEPTH = 80;
+const MAX_DEPTH = 24;
 
 export function toJson(value: unknown): Json {
   return encode(value, 0, new WeakSet<object>());
