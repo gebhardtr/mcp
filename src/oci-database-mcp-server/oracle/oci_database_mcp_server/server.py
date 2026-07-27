@@ -10,13 +10,19 @@ from typing import Annotated, Any, Optional
 
 import oci
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import (
+    get_access_token as _get_access_token,
+    get_http_request as _get_http_request,
+)
+from fastmcp.utilities.auth import parse_scopes
+
 from oci.database.models import (
     CreatePluggableDatabaseFromLocalCloneDetails,
     CreatePluggableDatabaseFromRelocateDetails,
     CreatePluggableDatabaseFromRemoteCloneDetails,
 )
 from oci.util import to_dict
-from oracle_mcp_common import build_auth_context
+from oracle_mcp_common import IDCSHttpAuth, build_auth_context, build_idcs_http_auth
 from oracle.oci_database_mcp_server.models import (
     ApplicationVip,
     ApplicationVipSummary,
@@ -284,6 +290,7 @@ logger = Logger(__name__, level="INFO")
 mcp = FastMCP(name=__project__)
 _user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
 _ADDITIONAL_UA = f"{_user_agent_name}/{__version__}"
+_http_auth: IDCSHttpAuth | None = None
 
 
 def _get_oci_client_kwargs(signer=None):
@@ -301,8 +308,30 @@ def _get_oci_client_kwargs(signer=None):
     return kwargs
 
 
+def _get_http_config_and_signer(
+    access_token: Any | None, region: str | None = None
+) -> tuple[dict[str, Any], Any]:
+    """Build caller-specific OCI SDK authentication for an HTTP request."""
+    if _http_auth is None:
+        raise RuntimeError("HTTP authentication policy has not been initialized.")
+    request_auth = _http_auth.context_for(
+        access_token.token if access_token else None, region=region
+    )
+    config = {**request_auth.config, "additional_user_agent": _ADDITIONAL_UA}
+    return config, request_auth.signer
+
+
 def _get_config_and_signer(region: str = None) -> tuple[dict[str, Any], Any]:
     """Resolve OCI SDK authentication and configuration for a client."""
+    access_token = _get_access_token()
+    if access_token is not None:
+        return _get_http_config_and_signer(access_token, region)
+    try:
+        _get_http_request()
+    except RuntimeError:
+        pass
+    else:
+        return _get_http_config_and_signer(access_token, region)
     auth_context = build_auth_context()
     config = {**auth_context.config, "additional_user_agent": _ADDITIONAL_UA}
     if region is not None:
@@ -7684,8 +7713,20 @@ def get_vm_cluster_update_history_entry(
 
 
 def main():
-    mcp.run()
+    global _http_auth
 
+    host = os.getenv("ORACLE_MCP_HOST")
+    port = os.getenv("ORACLE_MCP_PORT")
+
+    if not (host and port):
+        mcp.run()
+        return
+    required_scopes = parse_scopes(os.getenv("IDCS_REQUIRED_SCOPES")) or (
+        f"openid profile email oci_mcp.{__project__.removeprefix('oracle.oci-').removesuffix('-mcp-server').replace('-', '_')}.invoke".split()
+    )
+    _http_auth = build_idcs_http_auth(required_scopes)
+    mcp.auth = _http_auth.provider
+    mcp.run(transport="http", host=host, port=int(port))
 
 if __name__ == "__main__":
     main()

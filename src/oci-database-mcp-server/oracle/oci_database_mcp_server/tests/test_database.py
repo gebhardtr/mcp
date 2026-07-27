@@ -8,8 +8,13 @@ import pytest
 from fastmcp import Client
 import oracle.oci_database_mcp_server.models as models
 import oracle.oci_database_mcp_server.server as server
+from oracle.oci_database_mcp_server import __project__, __version__
 from oracle.oci_database_mcp_server.server import mcp
 from oracle_mcp_common import AuthContext, AuthType
+
+_EXPECTED_ADDITIONAL_UA = (
+    f"{__project__.split('oracle.', 1)[1].split('-server', 1)[0]}/{__version__}"
+)
 
 
 class TestGetDatabaseClient:
@@ -50,7 +55,7 @@ class TestGetDatabaseClient:
 
         mock_build_auth_context.assert_called_once_with()
         args, kwargs = mock_client.call_args
-        assert args[0]["additional_user_agent"] == "oci-database-mcp/1.1.0"
+        assert args[0]["additional_user_agent"] == _EXPECTED_ADDITIONAL_UA
         assert args[0]["region"] == "us-phoenix-1"
         assert original_config == context_config
         assert kwargs["signer"] is signer
@@ -79,11 +84,148 @@ class TestGetDatabaseClient:
         mock_build_auth_context.assert_called_once_with()
         args, kwargs = mock_client.call_args
         assert args[0] == {
-            "additional_user_agent": "oci-database-mcp/1.1.0",
+            "additional_user_agent": _EXPECTED_ADDITIONAL_UA,
             "region": "us-ashburn-1",
         }
         assert context_config == {"region": "us-ashburn-1"}
         assert kwargs["signer"] is signer
+
+
+class TestHttpAuthentication:
+    @staticmethod
+    def _mark_http_request(monkeypatch):
+        monkeypatch.setattr(server, "_get_http_request", lambda: object())
+
+    def test_http_client_uses_caller_specific_signers_and_exact_user_agent(
+        self, monkeypatch
+    ):
+        self._mark_http_request(monkeypatch)
+        tokens = iter(("first-token", "second-token"))
+        monkeypatch.setattr(
+            server, "_get_access_token", lambda: SimpleNamespace(token=next(tokens))
+        )
+        first_signer = object()
+        second_signer = object()
+        contexts = {
+            "first-token": SimpleNamespace(
+                config={"region": "us-chicago-1"}, signer=first_signer
+            ),
+            "second-token": SimpleNamespace(
+                config={"region": "us-chicago-1"}, signer=second_signer
+            ),
+        }
+        calls = []
+
+        def context_for(token, *, region=None):
+            calls.append((token, region))
+            return contexts[token]
+
+        monkeypatch.setattr(server, "_http_auth", SimpleNamespace(context_for=context_for))
+        monkeypatch.setattr(
+            server,
+            "build_auth_context",
+            lambda: pytest.fail("HTTP requests must not resolve stdio credentials"),
+        )
+        database_client = MagicMock()
+        monkeypatch.setattr(server.oci.database, "DatabaseClient", database_client)
+
+        server.get_database_client(region="eu-frankfurt-1")
+        server.get_database_client(region="us-chicago-1")
+
+        first_config, first_kwargs = database_client.call_args_list[0]
+        second_config, second_kwargs = database_client.call_args_list[1]
+        assert first_config[0] == {
+            "region": "us-chicago-1",
+            "additional_user_agent": _EXPECTED_ADDITIONAL_UA,
+        }
+        assert second_config[0] == first_config[0]
+        assert first_kwargs["signer"] is first_signer
+        assert second_kwargs["signer"] is second_signer
+        assert calls == [
+            ("first-token", "eu-frankfurt-1"),
+            ("second-token", "us-chicago-1"),
+        ]
+
+    def test_http_request_without_access_token_uses_common_policy(self, monkeypatch):
+        self._mark_http_request(monkeypatch)
+        monkeypatch.setattr(server, "_get_access_token", lambda: None)
+        calls = []
+
+        def context_for(token, *, region=None):
+            calls.append((token, region))
+            raise ValueError("HTTP requests require an authenticated IDCS access token.")
+
+        monkeypatch.setattr(server, "_http_auth", SimpleNamespace(context_for=context_for))
+
+        with pytest.raises(ValueError, match="authenticated IDCS access token"):
+            server._get_config_and_signer(region="us-ashburn-1")
+
+        assert calls == [(None, "us-ashburn-1")]
+
+    def test_http_request_requires_initialized_policy(self, monkeypatch):
+        self._mark_http_request(monkeypatch)
+        monkeypatch.setattr(
+            server, "_get_access_token", lambda: SimpleNamespace(token="token")
+        )
+        monkeypatch.setattr(server, "_http_auth", None)
+
+        with pytest.raises(RuntimeError, match="policy has not been initialized"):
+            server._get_config_and_signer()
+
+
+class TestMainHttpRun:
+    def test_main_initializes_provider_and_runs_http_transport(self, monkeypatch):
+        called = {}
+        provider = object()
+        http_auth = SimpleNamespace(provider=provider)
+        scopes = []
+
+        def fake_run(*args, **kwargs):
+            called["args"] = args
+            called["kwargs"] = kwargs
+
+        def build_http_auth(required_scopes):
+            scopes.append(required_scopes)
+            return http_auth
+
+        monkeypatch.setattr(server.mcp, "run", fake_run)
+        monkeypatch.setattr(server, "build_idcs_http_auth", build_http_auth)
+        monkeypatch.setattr(server, "_http_auth", None)
+        monkeypatch.setenv("IDCS_DOMAIN", "idcs.example.com")
+        monkeypatch.setenv("IDCS_CLIENT_ID", "client-id")
+        monkeypatch.setenv("IDCS_CLIENT_SECRET", "client-secret")
+        monkeypatch.setenv("IDCS_AUDIENCE", "mcp-audience")
+        monkeypatch.setenv("ORACLE_MCP_BASE_URL", "https://mcp.example.com")
+        monkeypatch.setenv("ORACLE_MCP_HOST", "127.0.0.1")
+        monkeypatch.setenv("ORACLE_MCP_PORT", "8081")
+
+        server.main()
+
+        assert scopes == [["openid", "profile", "email", "oci_mcp.database.invoke"]]
+        assert server.mcp.auth is provider
+        assert called == {
+            "args": (),
+            "kwargs": {"transport": "http", "host": "127.0.0.1", "port": 8081},
+        }
+
+    def test_main_rejects_invalid_http_auth_before_starting_listener(self, monkeypatch):
+        monkeypatch.setenv("ORACLE_MCP_HOST", "127.0.0.1")
+        monkeypatch.setenv("ORACLE_MCP_PORT", "8081")
+        monkeypatch.setattr(server, "_http_auth", None)
+        monkeypatch.setattr(
+            server,
+            "build_idcs_http_auth",
+            lambda _scopes: (_ for _ in ()).throw(
+                ValueError("HTTP IDCS authentication requires: IDCS_CLIENT_SECRET")
+            ),
+        )
+        run = MagicMock()
+        monkeypatch.setattr(server.mcp, "run", run)
+
+        with pytest.raises(ValueError, match="IDCS_CLIENT_SECRET"):
+            server.main()
+
+        run.assert_not_called()
 
 
 def test_oci_base_model_from_oci(monkeypatch):
@@ -3417,7 +3559,7 @@ async def test_get_public_ip_for_database(
     mock_vnic_response.data = mock_vnic
     mock_vcn_client.get_vnic.return_value = mock_vnic_response
 
-    config = {"additional_user_agent": "oci-database-mcp/1.1.0"}
+    config = {"additional_user_agent": _EXPECTED_ADDITIONAL_UA}
     signer = object()
     mock_get_config_and_signer.return_value = (config, signer)
 

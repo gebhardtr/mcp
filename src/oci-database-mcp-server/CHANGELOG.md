@@ -2,6 +2,20 @@
 
 All notable changes to OCI Database MCP Server are documented in this file.
 
+## 1.3.0
+
+### Added
+
+- Added OCI IAM/IDCS-authenticated HTTP transport. Each HTTP request exchanges
+  the authenticated caller's access token through `oracle-mcp-common` and uses
+  a caller-specific OCI SDK signer.
+
+### Changed
+
+- Updated FastMCP from 3.4.2 to 3.4.4 and the OCI Python SDK from 2.179.0 to
+  2.182.1. The MCP SDK is now supplied transitively by FastMCP rather than
+  declared as a direct dependency.
+
 ## 1.2.0
 
 ### Changed
