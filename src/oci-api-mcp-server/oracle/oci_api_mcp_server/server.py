@@ -33,6 +33,29 @@ denylist_manager = Denylist(logger)
 
 _OCI_COMMAND_TOKEN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _OCI_HELP_COMMAND_ERROR = "OCI help accepts command paths only without options or values"
+_SERVER_CONTROLLED_OPTIONS = {
+    "--auth",
+    "--cli-rc-file",
+    "--config-file",
+    "--defaults-file",
+    "--endpoint",
+    "--profile",
+}
+
+
+def _parse_oci_command(command: str) -> list[str]:
+    """Parse a command while protecting server-controlled OCI CLI options."""
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError("Invalid OCI command syntax") from exc
+
+    for token in command_tokens:
+        option = token.split("=", 1)[0]
+        if option in _SERVER_CONTROLLED_OPTIONS:
+            raise ValueError(f"Option '{option}' is controlled by the server and is not allowed")
+
+    return command_tokens
 
 
 def _parse_oci_help_command(command: str) -> list[str]:
@@ -198,6 +221,13 @@ def run_oci_command(
     profile = os.getenv("OCI_CONFIG_PROFILE") or oci.config.DEFAULT_PROFILE
     logger.info(f"run_oci_command called with command: {command} --profile {profile}")
 
+    try:
+        command_tokens = _parse_oci_command(command)
+    except ValueError as exc:
+        error_message = f"Command '{command}' was not executed: {exc}"
+        logger.error(error_message)
+        return {"error": error_message}
+
     if denylist_manager.isCommandInDenyList(command):
         error_message = (
             f"Command '{command}' is denied by denylist. This command is found in the "
@@ -211,7 +241,7 @@ def run_oci_command(
 
     try:
         result = subprocess.run(
-            ["oci", "--profile", profile, *_get_optional_oci_auth_args(profile), *shlex.split(command)],
+            ["oci", "--profile", profile, *_get_optional_oci_auth_args(profile), *command_tokens],
             env=env_copy,
             capture_output=True,
             text=True,

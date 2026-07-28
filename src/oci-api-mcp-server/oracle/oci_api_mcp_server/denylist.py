@@ -85,7 +85,20 @@ class Denylist:
         return " ".join(self._command_words(command))
 
     def isCommandInDenyList(self, command: str) -> bool:
-        command_without_params = self.remove_params_from_command(command.strip())
+        stripped_command = command.strip()
+        command_parts = shlex.split(stripped_command)
+        if command_parts and command_parts[0] == "oci":
+            command_parts = command_parts[1:]
+
+        for denied_command in self.denylist:
+            denied_parts = denied_command.split()
+            if any(
+                command_parts[index : index + len(denied_parts)] == denied_parts
+                for index in range(len(command_parts) - len(denied_parts) + 1)
+            ):
+                return True
+
+        command_without_params = self.remove_params_from_command(stripped_command)
         self.logger.info("Checking command: %s", command_without_params)
         return any(
             command_without_params == denied_command

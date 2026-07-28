@@ -379,6 +379,66 @@ class TestOCITools:
             }
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "compute instance list --endpoint https://attacker.example",
+            "compute instance list --endpoint=https://attacker.example",
+        ],
+    )
+    @patch("oracle.oci_api_mcp_server.server.subprocess.run")
+    async def test_run_oci_command_rejects_endpoint_override(self, mock_run, command):
+        async with Client(mcp) as client:
+            result = (await client.call_tool("run_oci_command", {"command": command})).data
+
+        assert "error" in result
+        assert "'--endpoint' is controlled by the server" in result["error"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("command", "option"),
+        [
+            ("compute instance list --auth instance_principal", "--auth"),
+            ("compute instance list --auth=resource_principal", "--auth"),
+            ("compute instance list --profile ADMIN", "--profile"),
+            ("compute instance list --config-file /tmp/other-config", "--config-file"),
+            ("--cli-rc-file /tmp/other-rc compute instance list", "--cli-rc-file"),
+            ("--defaults-file=/tmp/other-rc compute instance list", "--defaults-file"),
+        ],
+    )
+    @patch("oracle.oci_api_mcp_server.server.subprocess.run")
+    async def test_run_oci_command_rejects_authentication_override(
+        self, mock_run, command, option
+    ):
+        async with Client(mcp) as client:
+            result = (await client.call_tool("run_oci_command", {"command": command})).data
+
+        assert "error" in result
+        assert f"'{option}' is controlled by the server" in result["error"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "raw-request --http-method GET --target-uri https://169.254.169.254",
+            "--debug raw-request --http-method=GET --target-uri=https://example.com",
+            "--connection-timeout 5 raw-request --http-method GET --target-uri https://example.com",
+            "--realm-specific-endpoint raw-request --http-method GET --target-uri https://example.com",
+            "-d raw-request --http-method GET --target-uri https://example.com",
+        ],
+    )
+    @patch("oracle.oci_api_mcp_server.server.subprocess.run")
+    async def test_run_oci_command_denies_raw_request(self, mock_run, command):
+        async with Client(mcp) as client:
+            result = (await client.call_tool("run_oci_command", {"command": command})).data
+
+        assert "error" in result
+        assert "denied by denylist" in result["error"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     @patch("oracle.oci_api_mcp_server.server.subprocess.run")
     async def test_get_oci_commands_success(self, mock_run):
         mock_result = MagicMock()
@@ -463,6 +523,17 @@ class TestOCITools:
         denylist.denylist = ["compute instance terminate"]
 
         assert denylist.isCommandInDenyList(command) is True
+
+    def test_denylist_blocks_raw_request(self):
+        denylist = Denylist(MagicMock())
+
+        for command in (
+            "raw-request --http-method GET --target-uri https://example.com",
+            "--connection-timeout 5 raw-request --http-method GET --target-uri https://example.com",
+            "--realm-specific-endpoint raw-request --http-method GET --target-uri https://example.com",
+            "-d raw-request --http-method GET --target-uri https://example.com",
+        ):
+            assert denylist.isCommandInDenyList(command) is True
 
 
 class TestServer:

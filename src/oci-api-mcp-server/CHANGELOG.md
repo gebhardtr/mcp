@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.1 - 2026-07-22
+
+### Security
+
+- Blocked caller overrides of the OCI CLI endpoint, authentication mode, profile,
+  configuration file, and defaults file; denied arbitrary `raw-request` execution even
+  when global options precede the command.
+
+### Fixed
+
+- Aligned the OCI CLI telemetry version with the package version.
+
 ## 2.1.0
 
 ### Changed
