@@ -27,6 +27,7 @@ from oracle.oci_api_mcp_server.server import mcp
 __version__ = importlib.metadata.version(__project__)
 user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
 USER_AGENT = f"{user_agent_name}/{__version__}"
+OCI_CLI = server._OCI_CLI_BASE_COMMAND[0]
 DENYLIST_GENERATOR = runpy.run_path(
     str(Path(__file__).parents[5] / "scripts" / "oci-api-denylist-generator.py")
 )
@@ -66,7 +67,7 @@ class TestOCITools:
             assert mock_run.call_args.kwargs["env"]["OCI_SDK_APPEND_USER_AGENT"] == USER_AGENT
             mock_run.assert_called_once_with(
                 [
-                    "oci",
+                    OCI_CLI,
                     "--cli-rc-file",
                     os.devnull,
                     "compute",
@@ -106,7 +107,7 @@ class TestOCITools:
             assert result == "Help output"
             mock_run.assert_called_once_with(
                 [
-                    "oci",
+                    OCI_CLI,
                     "--cli-rc-file",
                     os.devnull,
                     "recovery",
@@ -184,7 +185,7 @@ class TestOCITools:
         mock_run.side_effect = subprocess.CalledProcessError(
             returncode=1,
             cmd=[
-                "oci",
+                OCI_CLI,
                 "--cli-rc-file",
                 os.devnull,
                 "compute",
@@ -270,7 +271,7 @@ class TestOCITools:
             }
             mock_run.assert_called_once_with(
                 [
-                    "oci",
+                    OCI_CLI,
                     "--cli-rc-file",
                     os.devnull,
                     "--config-file",
@@ -310,7 +311,7 @@ class TestOCITools:
 
         mock_run.assert_called_once_with(
             [
-                "oci",
+                OCI_CLI,
                 "--cli-rc-file",
                 os.devnull,
                 "--config-file",
@@ -351,7 +352,7 @@ class TestOCITools:
             await client.call_tool("run_oci_command", {"command": "compute instance list"})
 
         assert mock_run.call_args.args[0] == [
-            "oci",
+            OCI_CLI,
             "--cli-rc-file",
             os.devnull,
             "--config-file",
@@ -383,7 +384,7 @@ class TestOCITools:
             await client.call_tool("run_oci_command", {"command": "compute instance list"})
 
         assert mock_run.call_args.args[0] == [
-            "oci",
+            OCI_CLI,
             "--cli-rc-file",
             os.devnull,
             "--config-file",
@@ -414,7 +415,7 @@ class TestOCITools:
             await client.call_tool("run_oci_command", {"command": "compute instance list"})
 
         assert mock_run.call_args.args[0] == [
-            "oci",
+            OCI_CLI,
             "--cli-rc-file",
             os.devnull,
             "--config-file",
@@ -464,7 +465,7 @@ class TestOCITools:
             await client.call_tool("run_oci_command", {"command": "compute instance list"})
 
         assert mock_run.call_args.args[0] == [
-            "oci",
+            OCI_CLI,
             "--cli-rc-file",
             os.devnull,
             "--config-file",
@@ -563,7 +564,7 @@ class TestOCITools:
 
         mock_run.side_effect = subprocess.CalledProcessError(
             returncode=mock_result.returncode,
-            cmd=["oci", "--cli-rc-file", os.devnull] + command.split(),
+            cmd=[OCI_CLI, "--cli-rc-file", os.devnull] + command.split(),
             output=mock_result.stdout,
             stderr=mock_result.stderr,
         )
@@ -623,7 +624,7 @@ class TestOCITools:
 
         assert result["returncode"] == 0
         assert mock_run.call_args.args[0] == [
-            "oci",
+            OCI_CLI,
             "--cli-rc-file",
             os.devnull,
             "--config-file",
@@ -695,7 +696,7 @@ class TestOCITools:
             assert result == "OCI commands output"
             assert mock_run.call_args.kwargs["env"]["OCI_SDK_APPEND_USER_AGENT"] == USER_AGENT
             mock_run.assert_called_once_with(
-                ["oci", "--cli-rc-file", os.devnull, "--help"],
+                [OCI_CLI, "--cli-rc-file", os.devnull, "--help"],
                 env=ANY,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -711,7 +712,7 @@ class TestOCITools:
         mock_result.stderr = "Some error"
         mock_run.side_effect = subprocess.CalledProcessError(
             returncode=1,
-            cmd=["oci", "--cli-rc-file", os.devnull, "--help"],
+            cmd=[OCI_CLI, "--cli-rc-file", os.devnull, "--help"],
             output=None,
             stderr=mock_result.stderr,
         )
@@ -913,6 +914,11 @@ class TestDenylist:
 
 
 class TestServer:
+    def test_oci_cli_uses_server_environment(self):
+        assert Path(OCI_CLI).parent == Path(server.sys.executable).parent
+        assert importlib.metadata.version("oci-cli") == server._OCI_CLI_VERSION
+        assert f"oci-cli=={server._OCI_CLI_VERSION}" in importlib.metadata.requires(__project__)
+
     @patch("oracle.oci_api_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_without_host_and_port(self, mock_getenv, mock_mcp_run):
