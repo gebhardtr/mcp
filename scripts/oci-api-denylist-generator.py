@@ -10,6 +10,38 @@ import subprocess
 from datetime import datetime
 
 
+DENIED_ACTIONS = frozenset(
+    {
+        "delete",
+        "patch",
+        "put",
+        "remove",
+        "replace",
+        "terminate",
+        "update",
+    }
+)
+EXCLUDED_ACTION_PREFIXES = ("cancel-", "create-", "get-", "list-")
+ALWAYS_DENIED_COMMANDS = frozenset({"raw-request"})
+
+
+def is_denied_command(command: str) -> bool:
+    """Return whether a canonical CLI path is a denylist candidate."""
+    action = command.rsplit(" ", 1)[-1]
+    if action.startswith(EXCLUDED_ACTION_PREFIXES):
+        return False
+    return bool(DENIED_ACTIONS.intersection(action.split("-")))
+
+
+def get_denied_commands(commands: list[str]) -> list[str]:
+    """Return the reviewed-action candidates plus mandatory denied commands."""
+    return sorted(
+        ALWAYS_DENIED_COMMANDS.union(
+            command for command in commands if is_denied_command(command)
+        )
+    )
+
+
 def get_oci_version():
     result = subprocess.run(["oci", "--version", "--raw-output"], capture_output=True, text=True)
     return result.stdout.strip()
@@ -97,22 +129,10 @@ def create_denylist(version):
     with open(commands_file, "r") as f:
         commands = [line.strip() for line in f if not line.strip().startswith("#") and len(line.strip()) > 0]
 
-    actions = [
-        "delete",
-        "terminate",
-        "put",
-        "update",
-        "replace",
-        "remove",
-        "patch",
-    ]
-
-    denied_commands = [
-        cmd.strip() for cmd in commands if any(cmd.split()[-1].startswith(action) for action in actions)
-    ]
+    denied_commands = get_denied_commands(commands)
 
     with open(denylist_filename, "w") as f:
-        for command in sorted(denied_commands):
+        for command in denied_commands:
             f.write(command + "\n")
 
     with open(denylist_prefix, "w") as f:
@@ -126,7 +146,7 @@ def create_denylist(version):
                 "# It should also stop suggesting any alternatives to the user\n\n"
             )
         )
-        f.write("\n".join(sorted(denied_commands)))
+        f.write("\n".join(denied_commands))
 
     print(f"{denylist_prefix} has been created successfully")
 

@@ -15,12 +15,16 @@ To generate an updated version of the deny list, follow these steps:
    python oci-api-denylist-generator.py
    ```
 4. The script will generate a new `denylist_<version>` file and update the `denylist` file with the latest deny list based on the current OCI CLI version.
-5. To use the newly generated deny list, copy the denylist to the [oci-api-mcp-server denylist](../src/oci-api-mcp-server/oracle/oci_api_mcp_server/denylist) and restart the `oci-api-mcp-server`.
+5. Review the generated diff to confirm every candidate is a mutating operation and that no
+   mutating command uses an action outside the configured action set.
+6. Copy the reviewed denylist to the [oci-api-mcp-server denylist](../src/oci-api-mcp-server/oracle/oci_api_mcp_server/denylist) and restart the `oci-api-mcp-server`.
 
 ## Notes
 
 - The script automatically backs up the existing deny list file if it already exists for the current OCI CLI version.
-- The deny list includes commands that can potentially change the configuration of the cloud system.
+- Compound action names such as `bulk-delete` are included, while `create-*`, `get-*`,
+  `list-*`, and `cancel-*` commands are excluded from automatic classification.
+- The action-name classification produces review candidates; it is not a semantic guarantee.
 - The generated `denylist` file is used by the AI client to determine which commands to deny execution for.
 
 ----

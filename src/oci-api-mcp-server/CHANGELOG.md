@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.5
+
+### Security
+
+- Updated the denylist to match OCI CLI 3.89.3, supporting compound actions like `bulk-delete`.
+
 ## 2.1.4
 
 ### Changed
