@@ -4,7 +4,8 @@
 
 ### Security
 
-- Updated the denylist to match OCI CLI 3.89.3, supporting compound actions like `bulk-delete`.
+- Updated the denylist to match OCI CLI 3.89.3's complete canonical command tree,
+  supporting compound actions like `bulk-delete`.
 - Restricted execution to OCI CLI 3.89.3 installed in the MCP server environment.
 
 ## 2.1.4

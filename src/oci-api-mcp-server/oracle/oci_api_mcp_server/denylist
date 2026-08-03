@@ -50,9 +50,11 @@ ai-vision vision-private-endpoint delete
 ai-vision vision-private-endpoint update
 analytics analytics-instance delete
 analytics analytics-instance delete-private-access-channel
+analytics analytics-instance delete-resource-group
 analytics analytics-instance delete-vanity-url
 analytics analytics-instance update
 analytics analytics-instance update-private-access-channel
+analytics analytics-instance update-resource-group
 analytics analytics-instance update-vanity-url
 analytics work-request delete
 announce announcement-subscription delete
@@ -93,6 +95,8 @@ apm-config config update-macs-extension
 apm-config config update-metric-group
 apm-config config update-options
 apm-config config update-span-filter
+apm-config data-file delete
+apm-config data-file put
 apm-config match-agents-with-attribute-key update
 apm-control-plane apm-domain delete
 apm-control-plane apm-domain update
@@ -147,6 +151,7 @@ bastion session delete
 bastion session update
 batch batch-context delete
 batch batch-context update
+batch batch-context update-oci-logging-configuration
 batch batch-job update
 batch batch-job-pool delete
 batch batch-job-pool update
@@ -375,6 +380,11 @@ compute-management instance-pool update
 container-instances container update
 container-instances container-instance delete
 container-instances container-instance update
+costad cost-alert-subscription delete
+costad cost-alert-subscription update
+costad cost-anomaly-event update
+costad cost-anomaly-monitor delete
+costad cost-anomaly-monitor update
 cpg cluster-placement-group delete
 cpg cluster-placement-group update
 dashboard-service dashboard delete
@@ -595,10 +605,14 @@ data-safe unified-audit-policy-definition delete
 data-safe unified-audit-policy-definition update
 data-safe user-assessment delete
 data-safe user-assessment update
+data-science compute-target delete
+data-science compute-target update
+data-science compute-target update-compute-target-update-managed-compute-cluster-configuration-details
 data-science ds-private-endpoint delete
 data-science ds-private-endpoint update
 data-science job delete
 data-science job update
+data-science job update-job-managed-compute-cluster-job-infrastructure-configuration-details
 data-science job-run delete
 data-science job-run update
 data-science ml-app delete
@@ -619,6 +633,7 @@ data-science model update-model-provenance
 data-science model-deployment delete
 data-science model-deployment update
 data-science model-deployment update-model-deployment-update-model-group-deployment-configuration-details
+data-science model-deployment update-model-deployment-update-single-model-deployment-flex-configuration-details
 data-science model-group delete
 data-science model-group update
 data-science model-group-version-history delete
@@ -719,6 +734,13 @@ database-migration migration remove-mysql-objects
 database-migration migration remove-oracle-objects
 database-migration migration update-mysql-migration
 database-migration migration update-oracle-migration
+datacc infrastructure delete
+datacc infrastructure update
+datacc maintenance-run update
+datacc vm-cluster-network delete
+datacc vm-cluster-network update
+datacc vm-instance delete
+datacc vm-instance update
 db advanced-cluster-file-system delete
 db advanced-cluster-file-system update
 db application-vip delete
@@ -843,12 +865,34 @@ dbtools connection update-generic-jdbc
 dbtools connection update-mysql-database
 dbtools connection update-oracle-database
 dbtools connection update-postgresql
+dbtools database-api-gateway-config delete
+dbtools database-api-gateway-config remove-lock
+dbtools database-api-gateway-config update-database-api-gateway-config-default
 dbtools identity delete
 dbtools identity remove-lock
 dbtools identity update-oracle-database-resource-principal
+dbtools mcp-server cascading-delete
+dbtools mcp-server delete
+dbtools mcp-server remove-lock
+dbtools mcp-server update-mcp-server-default
+dbtools mcp-toolset delete
+dbtools mcp-toolset remove-lock
+dbtools mcp-toolset update-mcp-toolset-built-in-sql-tools
+dbtools mcp-toolset update-mcp-toolset-custom-sql-tool
+dbtools mcp-toolset update-mcp-toolset-customizable-reporting-tools
+dbtools mcp-toolset update-mcp-toolset-gen-ai-sql-assistant
 dbtools private-endpoint delete
 dbtools private-endpoint remove-lock
 dbtools private-endpoint update
+dbtools sql-report delete
+dbtools sql-report remove-lock
+dbtools sql-report update-sql-report-oracle-database
+dbtools-runtime credential delete
+dbtools-runtime database-api-gateway-config-pool delete
+dbtools-runtime database-api-gateway-config-pool-api-spec delete
+dbtools-runtime database-api-gateway-config-pool-auto-api-spec delete
+dbtools-runtime execute-grantee delete
+dbtools-runtime public-synonym delete
 delegate-access-control delegation-control delete
 delegate-access-control delegation-control update
 delegate-access-control delegation-subscription delete
@@ -1114,14 +1158,23 @@ fs replication-target delete
 fs snapshot delete
 fs snapshot remove
 fs snapshot update
+fusion-apps email-subdomain delete
+fusion-apps email-subdomain update
 fusion-apps fusion-environment delete
 fusion-apps fusion-environment delete-fusion-environment-admin-user
 fusion-apps fusion-environment update
 fusion-apps fusion-environment-family delete
 fusion-apps fusion-environment-family update
+fusion-apps marketing-brand delete
+fusion-apps marketing-brand update
+fusion-apps microsite delete
+fusion-apps microsite update
 fusion-apps refresh-activity delete
 fusion-apps service-attachment delete
 fusion-apps update-refresh-activity-details update-refresh-activity
+fusion-apps vanity-domain update
+fusion-apps vanity-domain-activity delete
+fusion-apps vanity-domain-activity update
 gdp pipeline delete
 gdp pipeline update
 generative-ai api-key delete
@@ -1136,6 +1189,8 @@ generative-ai generative-ai-project delete
 generative-ai generative-ai-project update
 generative-ai hosted-application delete
 generative-ai hosted-application update
+generative-ai hosted-application-iam delete
+generative-ai hosted-application-iam update
 generative-ai hosted-application-storage delete
 generative-ai hosted-deployment delete
 generative-ai hosted-deployment delete-hosted-deployment-artifact
@@ -1444,12 +1499,14 @@ jms-utils performance-tuning-analysis delete
 jms-utils subscription-acknowledgment-configuration update
 kafka cluster delete
 kafka cluster update
+kafka cluster update-public-connectivity-addon
 kafka cluster-config delete
 kafka cluster-config update
 kafka cluster-config-version delete
 kms ekm ekms-private-endpoint delete
 kms ekm ekms-private-endpoint update
 kms kms-hsm-cluster hsm-cluster update
+kms kms-hsm-cluster hsm-cluster update-audit-logging-destination
 kms management key update
 kms management vault delete-vault-replica
 kms management vault update
@@ -1667,6 +1724,7 @@ network ipv6 bulk-delete
 network ipv6 bulk-update
 network ipv6 delete
 network ipv6 update
+network letter-of-authority update-cross-connect
 network local-peering-gateway delete
 network local-peering-gateway update
 network nat-gateway delete
@@ -1693,11 +1751,13 @@ network security-list update
 network service-gateway delete
 network service-gateway update
 network subnet delete
+network subnet patch
 network subnet remove-ipv4-subnet-cidr
 network subnet remove-ipv6-subnet-cidr
 network subnet update
 network tunnel-cpe-device-config update
 network vcn delete
+network vcn patch
 network vcn remove-ipv6-vcn-cidr
 network vcn remove-vcn-cidr
 network vcn update
@@ -1956,6 +2016,10 @@ psql db-system delete
 psql db-system patch
 psql db-system update
 psql db-system update-db-system-db-instance
+psql db-system update-db-system-disabled-insight-details
+psql db-system update-db-system-disabled-kerberos-auth-details
+psql db-system update-db-system-enabled-insight-details
+psql db-system update-db-system-enabled-kerberos-auth-details
 queue messages delete-message
 queue messages delete-messages
 queue messages put-messages
@@ -1972,6 +2036,8 @@ recovery protection-policy delete
 recovery protection-policy update
 recovery recovery-service-subnet delete
 recovery recovery-service-subnet update
+redis oci-cache-backup oci-cache-backup delete
+redis oci-cache-backup oci-cache-backup update
 redis oci-cache-config-set oci-cache-config-set delete
 redis oci-cache-config-set oci-cache-config-set update
 redis oci-cache-user oci-cache-user delete
@@ -1987,7 +2053,7 @@ resource-analytics tenancy-attachment delete
 resource-analytics tenancy-attachment update
 resource-manager configuration-source-provider delete
 resource-manager configuration-source-provider update
-resource-manager configuration-source-provider update-bitbucket-cloud-username-app-password-provider
+resource-manager configuration-source-provider update-bitbucket-cloud-email-api-token-provider
 resource-manager configuration-source-provider update-bitbucket-server-access-token-provider
 resource-manager configuration-source-provider update-github-access-token-provider
 resource-manager configuration-source-provider update-gitlab-access-token-provider

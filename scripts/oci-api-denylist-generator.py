@@ -5,9 +5,12 @@ https://oss.oracle.com/licenses/upl.
 """
 
 import os
-import re
-import subprocess
 from datetime import datetime
+from importlib.metadata import version
+
+import click
+from oci_cli import dynamic_loader
+from oci_cli.cli_root import cli
 
 
 DENIED_ACTIONS = frozenset(
@@ -43,78 +46,39 @@ def get_denied_commands(commands: list[str]) -> list[str]:
 
 
 def get_oci_version():
-    result = subprocess.run(["oci", "--version", "--raw-output"], capture_output=True, text=True)
-    return result.stdout.strip()
+    return version("oci-cli")
 
 
-def get_services():
-    result = subprocess.run(["oci", "--help"], capture_output=True, text=True)
-    output = result.stdout.splitlines()
-    services = []
-    for line in output:
-        match = re.match(r"^\s{4}(\w+(-\w+)*)", line)
-        if match:
-            services.append(match.group(1))
-    services = services[5:]  # Skipping the first 5 lines as they are not services
-    services.sort()
-    return services
-
-
-def get_sub_commands(command: str):
-    indentation_level = len(command.split())
-    print(f"{'  ' * indentation_level}Getting subcommands for: {command}")
-    try:
-        result = subprocess.run(f"oci {command} --help", shell=True, capture_output=True, text=True)
-        output = result.stdout.splitlines()
-        sub_commands = []
-        in_commands_section = False
-        for line in output:
-            if "Commands:" in line:
-                in_commands_section = True
-                continue
-            if in_commands_section:
-                if line.startswith("   "):
-                    continue
-                # match = re.match(r"^\s{2}(\w+)", line)
-                match = line.split()[0]
-                if match:
-                    print(f"{'  ' * indentation_level}Appending sub command {match}")
-                    sub_commands.append(match)
-        if not sub_commands:
-            return [command]
-        else:
-            commands = []
-            for sub_command in sub_commands:
-                commands.extend(get_sub_commands(f"{command} {sub_command}"))
-            return commands
-    except Exception as e:
-        print(f"Error getting sub-commands for {command}: {e}")
-        return []
+def get_canonical_commands() -> list[str]:
+    """Return every canonical leaf command from the installed OCI CLI."""
+    dynamic_loader.load_all_services()
+    commands = []
+    groups = [("", cli)]
+    while groups:
+        prefix, group = groups.pop()
+        for name, command in group.commands.items():
+            command_path = f"{prefix} {name}".strip()
+            if isinstance(command, click.Group):
+                groups.append((command_path, command))
+            else:
+                commands.append(command_path)
+    return sorted(commands)
 
 
 def get_commands(version):
     commands_file = f"commands_{version}.txt"
-    if not os.path.exists(commands_file):
-        print(f"Creating {commands_file} file..")
-        services = get_services()
-        with open(commands_file, "w") as f:
-            f.write(
-                (
-                    "# Copyright (c) 2025, Oracle and/or its affiliates.\n"
-                    "# Licensed under the Universal Permissive License v1.0 as shown at\n"
-                    "# https://oss.oracle.com/licenses/upl.\n\n"
-                    "# This list contains all OCI cli commands\n\n"
-                )
+    print(f"Creating {commands_file} file..")
+    with open(commands_file, "w") as f:
+        f.write(
+            (
+                "# Copyright (c) 2025, Oracle and/or its affiliates.\n"
+                "# Licensed under the Universal Permissive License v1.0 as shown at\n"
+                "# https://oss.oracle.com/licenses/upl.\n\n"
+                "# This list contains all OCI cli commands\n\n"
             )
-
-            for service in services:
-                print(f"Generating commands for service: {service}")
-                commands = get_sub_commands(service)
-                for command in commands:
-                    f.write(command + "\n")
-                    f.flush()
-    else:
-        print(f"Commands already exist for version {version}")
+        )
+        for command in get_canonical_commands():
+            f.write(command + "\n")
 
 
 def create_denylist(version):

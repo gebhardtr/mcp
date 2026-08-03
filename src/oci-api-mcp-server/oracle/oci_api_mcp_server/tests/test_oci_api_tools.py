@@ -912,6 +912,20 @@ class TestDenylist:
     def test_denylist_generator_preserves_mandatory_commands(self):
         assert DENYLIST_GENERATOR["get_denied_commands"]([]) == ["raw-request"]
 
+    def test_packaged_denylist_matches_classified_cli_commands(self):
+        expected = set(
+            DENYLIST_GENERATOR["get_denied_commands"](
+                DENYLIST_GENERATOR["get_canonical_commands"]()
+            )
+        )
+        actual = set(Denylist(MagicMock()).denylist)
+        missing = sorted(expected - actual)
+        stale = sorted(actual - expected)
+
+        assert not missing and not stale, (
+            f"Missing denylist paths: {missing}; stale paths: {stale}"
+        )
+
 
 class TestServer:
     def test_oci_cli_uses_server_environment(self):
