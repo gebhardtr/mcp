@@ -15,7 +15,8 @@ To generate an updated version of the deny list, follow these steps:
    uv run --project ../src/oci-api-mcp-server python oci-api-denylist-generator.py
    ```
 4. The script enumerates the installed OCI CLI's canonical Click command tree, generates a new
-   `denylist_<version>` file, and updates the `denylist` file for that CLI version.
+   `denylist_<version>` file, and atomically updates the generated files in the `scripts`
+   directory for that CLI version.
 5. Review the generated diff to confirm every candidate is a mutating operation and that no
    mutating command uses an action outside the configured action set.
 6. Copy the reviewed denylist to the [oci-api-mcp-server denylist](../src/oci-api-mcp-server/oracle/oci_api_mcp_server/denylist) and restart the `oci-api-mcp-server`.

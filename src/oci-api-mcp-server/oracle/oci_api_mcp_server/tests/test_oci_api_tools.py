@@ -912,6 +912,21 @@ class TestDenylist:
     def test_denylist_generator_preserves_mandatory_commands(self):
         assert DENYLIST_GENERATOR["get_denied_commands"]([]) == ["raw-request"]
 
+    def test_denylist_generator_does_not_follow_output_symlinks(self, tmp_path):
+        target = tmp_path / "target"
+        output = tmp_path / "denylist"
+        target.write_text("keep me")
+        try:
+            output.symlink_to(target)
+        except OSError:
+            pytest.skip("Symbolic links are not available")
+
+        DENYLIST_GENERATOR["write_file"](output, "replacement")
+
+        assert target.read_text() == "keep me"
+        assert output.read_text() == "replacement"
+        assert not output.is_symlink()
+
     def test_packaged_denylist_matches_classified_cli_commands(self):
         expected = set(
             DENYLIST_GENERATOR["get_denied_commands"](
