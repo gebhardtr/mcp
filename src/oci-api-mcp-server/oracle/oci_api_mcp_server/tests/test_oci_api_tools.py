@@ -948,6 +948,28 @@ class TestServer:
         assert importlib.metadata.version("oci-cli") == server._OCI_CLI_VERSION
         assert f"oci-cli=={server._OCI_CLI_VERSION}" in importlib.metadata.requires(__project__)
 
+    @patch("oracle.oci_api_mcp_server.server.importlib.metadata.version")
+    @patch("oracle.oci_api_mcp_server.server.shutil.which")
+    def test_resolve_oci_cli_success(self, mock_which, mock_version):
+        mock_which.return_value = "/server-environment/bin/oci"
+        mock_version.return_value = server._OCI_CLI_VERSION
+
+        assert server._resolve_oci_cli() == "/server-environment/bin/oci"
+
+    @patch("oracle.oci_api_mcp_server.server.importlib.metadata.version")
+    @patch("oracle.oci_api_mcp_server.server.shutil.which", return_value=None)
+    def test_resolve_oci_cli_fails_when_executable_is_missing(self, _, mock_version):
+        with pytest.raises(RuntimeError, match="OCI CLI 3.89.3 is required"):
+            server._resolve_oci_cli()
+
+        mock_version.assert_not_called()
+
+    @patch("oracle.oci_api_mcp_server.server.importlib.metadata.version", return_value="3.89.2")
+    @patch("oracle.oci_api_mcp_server.server.shutil.which", return_value="/server/bin/oci")
+    def test_resolve_oci_cli_fails_when_version_mismatches(self, *_):
+        with pytest.raises(RuntimeError, match="OCI CLI 3.89.3 is required"):
+            server._resolve_oci_cli()
+
     @patch("oracle.oci_api_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_without_host_and_port(self, mock_getenv, mock_mcp_run):
