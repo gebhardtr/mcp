@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { PodmanIsolationProvider } from "../src/isolation/podman.ts";
+import { runJavaScriptInIsolate } from "../src/sandbox-isolate.ts";
 import { runJavaScript as runJavaScriptWithProvider } from "../src/sandbox.ts";
 import type {
   HostRpcRequest,
@@ -157,11 +158,18 @@ test("sandbox rejects invalid OCI requests above isolation providers", async () 
   });
 });
 
-test("sandbox aborts and terminates an isolation provider at the deadline", async () => {
+test("sandbox aborts and drains OCI work before returning at the deadline", async () => {
   let signal: AbortSignal | undefined;
+  let rpcSettled = false;
   let terminateCalls = 0;
   const provider = testProvider((_code, options) => {
     signal = options.signal;
+    void options.hostRpc({
+      binding: "oracle",
+      namespace: "oci",
+      operation: "config",
+      payload: {}
+    });
     return {
       result: new Promise(() => undefined),
       async terminate() {
@@ -173,13 +181,21 @@ test("sandbox aborts and terminates an isolation provider at the deadline", asyn
   const startedAt = Date.now();
   const result = await runJavaScript("while (true) {}", {
     timeoutSeconds: 1,
-    hostRpc: async () => null,
+    hostRpc: async (_request, rpcSignal) => new Promise<null>(resolve => {
+      rpcSignal?.addEventListener("abort", () => {
+        setTimeout(() => {
+          rpcSettled = true;
+          resolve(null);
+        }, 25);
+      }, { once: true });
+    }),
     isolationProvider: provider
   });
 
   assert.equal(result.timedOut, true);
   assert.equal(result.exitCode, -1);
   assert.equal(signal?.aborted, true);
+  assert.equal(rpcSettled, true);
   assert.equal(terminateCalls, 1);
   assert(Date.now() - startedAt < 5000);
 });
@@ -204,10 +220,7 @@ test("sandbox rejects oversized results returned by an isolation provider", asyn
 
   assert.equal(result.result, null);
   assert.equal(result.exitCode, 1);
-  assert.match(
-    result.error?.message ?? "",
-    /isolation provider returned an invalid result: result was .* exceeding limit 1048576 bytes/
-  );
+  assert.equal(result.error?.message, "isolation provider failed");
 });
 
 test("sandbox rejects malformed isolation provider results", async () => {
@@ -230,7 +243,7 @@ test("sandbox rejects malformed isolation provider results", async () => {
 
   assert.equal(result.result, null);
   assert.equal(result.exitCode, 1);
-  assert.match(result.error?.message ?? "", /result must be JSON-compatible/);
+  assert.equal(result.error?.message, "isolation provider failed");
 });
 
 test("sandbox reports isolation provider cleanup failures", async () => {
@@ -255,10 +268,7 @@ test("sandbox reports isolation provider cleanup failures", async () => {
 
   assert.equal(result.result, null);
   assert.equal(result.exitCode, 1);
-  assert.match(
-    result.error?.message ?? "",
-    /isolation provider cleanup failed: cleanup broke/
-  );
+  assert.equal(result.error?.message, "isolation provider cleanup failed");
 });
 
 test("sandbox does not hide cleanup failures behind a timeout result", async () => {
@@ -282,10 +292,7 @@ test("sandbox does not hide cleanup failures behind a timeout result", async () 
   });
 
   assert.equal(result.timedOut, false);
-  assert.match(
-    result.error?.message ?? "",
-    /isolation provider cleanup failed: cleanup broke after timeout/
-  );
+  assert.equal(result.error?.message, "isolation provider cleanup failed");
 });
 
 test("sandbox runs JavaScript and calls host OCI RPC", async () => {
@@ -294,6 +301,7 @@ test("sandbox runs JavaScript and calls host OCI RPC", async () => {
     `
     const compute = new oci.core.ComputeClient();
     const response = await compute.listInstances({ compartmentId: "ocid1.compartment" });
+    console.error("guest diagnostic");
     console.log(response.items[0].displayName);
     `,
     {
@@ -306,7 +314,7 @@ test("sandbox runs JavaScript and calls host OCI RPC", async () => {
   );
 
   assert.equal(result.exitCode, 0);
-  assert.equal(result.stderr, "");
+  assert.equal(result.stderr, "guest diagnostic\n");
   assert.equal(result.stdout.trim(), "bulletproof-tiger");
   assert.deepEqual(requests, [
     {
@@ -637,7 +645,7 @@ test("sandbox follows OCI list page tokens through normal RPC calls", async () =
   ]);
 });
 
-test("sandbox formats object-shaped host RPC errors", async () => {
+test("sandbox exposes only allowlisted host RPC error details", async () => {
   const result = await runJavaScript(
     `
     try {
@@ -649,7 +657,8 @@ test("sandbox formats object-shaped host RPC errors", async () => {
         statusCode: error.statusCode,
         serviceCode: error.serviceCode,
         opcRequestId: error.opcRequestId,
-        keys: Object.keys(error).sort()
+        keys: Object.keys(error).sort(),
+        serialized: JSON.stringify(error)
       };
     }
     `,
@@ -660,7 +669,15 @@ test("sandbox formats object-shaped host RPC errors", async () => {
         Object.defineProperties(error, {
           statusCode: { value: 400 },
           serviceCode: { value: "InvalidParameter" },
-          opcRequestId: { value: "req1" }
+          opcRequestId: { value: "req1" },
+          requestEndpoint: { value: "https://internal.example/signed?token=secret" },
+          response: {
+            value: {
+              headers: { authorization: "secret authorization" },
+              body: { message: "secret response body" }
+            }
+          },
+          cause: { value: new Error("secret cause") }
         });
         throw error;
       }
@@ -670,12 +687,13 @@ test("sandbox formats object-shaped host RPC errors", async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.stderr, "");
   assert.deepEqual(result.result, {
-    message: "bad request",
+    message: "OCI call failed",
     name: "Error",
     statusCode: 400,
     serviceCode: "InvalidParameter",
     opcRequestId: "req1",
-    keys: ["name", "opcRequestId", "serviceCode", "statusCode"]
+    keys: ["opcRequestId", "serviceCode", "statusCode"],
+    serialized: "{\"statusCode\":400,\"serviceCode\":\"InvalidParameter\",\"opcRequestId\":\"req1\"}"
   });
 });
 
@@ -853,7 +871,7 @@ test("sandbox OCI proxies are not mistaken for promises", async () => {
   });
 });
 
-test("sandbox drains RPC calls triggered while serializing final result", async () => {
+test("sandbox does not extend execution for RPC calls triggered during result serialization", async () => {
   let hostCalls = 0;
   const result = await runJavaScript(
     `
@@ -876,7 +894,7 @@ test("sandbox drains RPC calls triggered while serializing final result", async 
 
   assert.equal(result.exitCode, 0);
   assert.deepEqual(result.result, { name: "zavala" });
-  assert.equal(hostCalls, 1);
+  assert.equal(hostCalls, 0);
 });
 
 test("sandbox blocks Node built-ins and network access", async () => {
@@ -922,7 +940,6 @@ test("sandbox does not expose host RPC bridge internals", async () => {
   const result = await runJavaScript(
     `
     console.log(typeof __hostRpc);
-    console.log(typeof __ociRpcPending);
     console.log(typeof __ociSandboxDone);
     try {
       oci = {};
@@ -945,14 +962,13 @@ test("sandbox does not expose host RPC bridge internals", async () => {
   assert.deepEqual(result.stdout.trim().split("\n"), [
     "undefined",
     "undefined",
-    "undefined",
     "oci hardened",
     "function"
   ]);
   assert.equal(hostCalls, 0);
 });
 
-test("sandbox drains fire-and-forget host RPC calls before returning", async () => {
+test("sandbox rejects fire-and-forget host RPC calls after draining them", async () => {
   let hostCalls = 0;
   const result = await runJavaScript(
     `
@@ -969,17 +985,58 @@ test("sandbox drains fire-and-forget host RPC calls before returning", async () 
     }
   );
 
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.error?.message, "JavaScript completed with unawaited OCI calls");
   assert.equal(result.stderr, "");
-  assert.equal(result.stdout.trim(), "user code returned");
+  assert.equal(result.stdout, "");
   assert.equal(hostCalls, 1);
 });
 
-test("sandbox drains host RPC calls chained from unsettled promises", async () => {
+test("sandbox rejects provider completion while accepted OCI work is pending", async () => {
+  let rpcSettled = false;
+  const provider = testProvider((_code, options) => {
+    queueMicrotask(() => {
+      void options.hostRpc({
+        binding: "oracle",
+        namespace: "oci",
+        operation: "config",
+        payload: {}
+      });
+    });
+    return {
+      result: Promise.resolve({
+        result: "completed",
+        error: null,
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false
+      }),
+      async terminate() {}
+    };
+  });
+
+  const result = await runJavaScript("0;", {
+    timeoutSeconds: 10,
+    hostRpc: async () => {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      rpcSettled = true;
+      return {};
+    },
+    isolationProvider: provider
+  });
+
+  assert.equal(result.result, null);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.error?.message, "JavaScript completed with unawaited OCI calls");
+  assert.equal(rpcSettled, true);
+});
+
+test("sandbox supports explicitly awaited host RPC chains", async () => {
   let hostCalls = 0;
   const result = await runJavaScript(
     `
-    oci.core.ComputeClient.listInstances({ compartmentId: "ocid1.compartment" })
+    await oci.core.ComputeClient.listInstances({ compartmentId: "ocid1.compartment" })
       .then(() => oci.core.ComputeClient.getInstance({ instanceId: "ocid1.instance" }));
     console.log("user code returned");
     `,
@@ -1005,11 +1062,9 @@ test("sandbox caps concurrent host OCI RPC calls", async () => {
     const calls = Array.from({ length: 8 }, () =>
       oci.core.ComputeClient.listInstances({ compartmentId: "ocid1.compartment" })
     );
-    try {
-      await Promise.all(calls);
-    } catch (error) {
-      console.log(error.message);
-    }
+    const results = await Promise.allSettled(calls);
+    const rejected = results.find(result => result.status === "rejected");
+    console.log(rejected.reason.message);
     `,
     {
       timeoutSeconds: 10,

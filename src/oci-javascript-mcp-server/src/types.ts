@@ -32,7 +32,10 @@ export type HostRpcRequest = {
   payload: JsonObject;
 };
 
-export type HostRpcHandler = (request: HostRpcRequest, timeoutMs?: number) => Promise<Json>;
+export type HostRpcHandler = (
+  request: HostRpcRequest,
+  signal?: AbortSignal
+) => Promise<Json>;
 
 export type OciReflectionManifest = {
   services: {

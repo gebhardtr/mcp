@@ -6,10 +6,13 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createOciReflectionManifest, createOciSdkHostRpc } from "../src/oci-host.ts";
+
+const require = createRequire(import.meta.url);
 
 test("host RPC config returns principal from config-file user", async () => {
   class Provider {
@@ -233,15 +236,8 @@ test("host RPC applies per-client region to a fresh provider", async () => {
   });
 });
 
-test("host RPC applies trusted deadline context to OCI client configuration", async () => {
+test("host RPC applies the trusted cancellation signal to OCI clients", async () => {
   const calls: unknown[] = [];
-  class CircuitBreaker {
-    circuit = {};
-
-    constructor(options: unknown) {
-      calls.push({ circuitBreaker: options });
-    }
-  }
   class ComputeClient {
     constructor(options: unknown, clientConfiguration: unknown) {
       calls.push({ constructor: { options, clientConfiguration } });
@@ -258,8 +254,9 @@ test("host RPC applies trusted deadline context to OCI client configuration", as
       ConfigFileAuthenticationDetailsProvider: class Provider {},
       core: { ComputeClient }
     },
-    common: { CircuitBreaker }
+    common: {}
   }));
+  const abortController = new AbortController();
   await hostRpc({
     binding: "oracle",
     namespace: "oci",
@@ -270,19 +267,60 @@ test("host RPC applies trusted deadline context to OCI client configuration", as
       operation: "listInstances",
       request: { compartmentId: "ocid1.compartment.oc1..example" }
     }
-  }, 1234.2);
+  }, abortController.signal);
 
-  assert.deepEqual(calls[0], { circuitBreaker: { timeout: 1235 } });
-  const constructorCall = calls[1] as {
+  const constructorCall = calls[0] as {
     constructor: {
-      clientConfiguration: {
-        circuitBreaker: unknown;
-        httpOptions?: unknown;
-      };
+      clientConfiguration: { httpOptions?: unknown };
     };
   };
-  assert.equal(constructorCall.constructor.clientConfiguration.circuitBreaker instanceof CircuitBreaker, true);
-  assert.equal(constructorCall.constructor.clientConfiguration.httpOptions, undefined);
+  assert.deepEqual(constructorCall.constructor.clientConfiguration, {
+    httpOptions: { signal: abortController.signal }
+  });
+});
+
+test("host cancellation configuration works with the real OCI HTTP client", async () => {
+  const common = require("oci-common") as Record<string, any>;
+  class ComputeClient {
+    readonly httpClient: any;
+
+    constructor(_options: unknown, configuration: { httpOptions?: unknown }) {
+      this.httpClient = new common.FetchHttpClient(null, undefined, configuration.httpOptions);
+    }
+
+    async listInstances() {
+      const response = await this.httpClient.send({
+        method: "GET",
+        headers: new Headers(),
+        uri: "data:application/json,%7B%7D"
+      });
+      return { status: response.status };
+    }
+
+    close() {}
+  }
+
+  const hostRpc = createOciSdkHostRpc(() => ({
+    sdk: {
+      ConfigFileAuthenticationDetailsProvider: class Provider {},
+      core: { ComputeClient }
+    },
+    common
+  }));
+  const abortController = new AbortController();
+  const result = await hostRpc({
+    binding: "oracle",
+    namespace: "oci",
+    operation: "invoke",
+    payload: {
+      service: "core",
+      client: { name: "ComputeClient" },
+      operation: "listInstances",
+      request: {}
+    }
+  }, abortController.signal);
+
+  assert.deepEqual(result, { status: 200 });
 });
 
 test("host RPC rejects unsupported client options", async () => {
@@ -329,28 +367,15 @@ test("host RPC rejects malformed client regions", async () => {
   );
 });
 
-test("host RPC redacts HTTP transport artifacts without changing normal fields", async () => {
+test("host RPC preserves fields returned by SDK operations", async () => {
   class ComputeClient {
     async getInstance() {
       const response: any = {
         request: { id: "business-request-field" },
-        httpRequest: {
-          method: "GET",
-          url: "https://iaas.example.invalid",
-          headers: { authorization: "redacted" }
-        },
-        nested: {
-          authenticationDetailsProvider: {
-            privateKey: "redacted"
-          },
-          request: {
-            method: "POST",
-            url: "https://iaas.example.invalid",
-            headers: { authorization: "redacted" }
-          },
-          value: 1
-        },
-        signer: { sessionToken: "redacted" }
+        size: 42n,
+        privateKey: "operation-result-private-key",
+        securityToken: { token: "operation-result-security-token" },
+        sessionToken: { token: "operation-result-session-token" }
       };
       response.self = response;
       return response;
@@ -379,7 +404,10 @@ test("host RPC redacts HTTP transport artifacts without changing normal fields",
 
   assert.deepEqual(result, {
     request: { id: "business-request-field" },
-    nested: { value: 1 },
+    size: { __oci_wire_type: "bigint", value: "42" },
+    privateKey: "operation-result-private-key",
+    securityToken: { token: "operation-result-security-token" },
+    sessionToken: { token: "operation-result-session-token" },
     self: "[Circular]"
   });
 });
@@ -763,9 +791,18 @@ test("host RPC reports unknown discovery targets and client operations", async (
 });
 
 test("host RPC rejects oversized OCI responses", async () => {
+  let lateGetterRead = false;
   class ComputeClient {
     async listInstances() {
-      return { items: ["x".repeat(1024 * 1024)] };
+      const response = { items: ["x".repeat(1024 * 1024)] } as Record<string, unknown>;
+      Object.defineProperty(response, "late", {
+        enumerable: true,
+        get() {
+          lateGetterRead = true;
+          throw new Error("late response field should not be read");
+        }
+      });
+      return response;
     }
 
     close() {}
@@ -791,6 +828,64 @@ test("host RPC rejects oversized OCI responses", async () => {
       }
     }),
     /exceeding response limit 1048576 bytes.*smaller limit/
+  );
+  assert.equal(lateGetterRead, false);
+});
+
+test("host RPC rejects OCI responses that exceed structural and framing budgets", async () => {
+  let response: unknown = { items: Array.from({ length: 10_001 }, () => null) };
+  class ComputeClient {
+    async listInstances() {
+      return response;
+    }
+  }
+  const loadSdk = () => ({
+    sdk: {
+      ConfigFileAuthenticationDetailsProvider: class Provider {},
+      core: { ComputeClient }
+    },
+    common: {}
+  });
+  const hostRpc = createOciSdkHostRpc(loadSdk);
+
+  const invoke = (rpc = hostRpc) => rpc({
+    binding: "oracle",
+    namespace: "oci",
+    operation: "invoke",
+    payload: {
+      service: "core",
+      client: { name: "ComputeClient" },
+      operation: "listInstances",
+      request: {}
+    }
+  });
+
+  await assert.rejects(
+    invoke(),
+    /array exceeded length limit 10000/
+  );
+  response = {
+    items: Object.fromEntries(Array.from({ length: 50_001 }, (_, index) => [`k${index}`, null]))
+  };
+  await assert.rejects(
+    invoke(),
+    /exceeded traversal node limit 50000/
+  );
+
+  const environmentName = "OCI_JAVASCRIPT_MAX_HOST_RPC_RESPONSE_BYTES";
+  const previous = process.env[environmentName];
+  process.env[environmentName] = "3000000";
+  const moduleUrl = new URL("../src/oci-host.ts?clamped-response-limit", import.meta.url);
+  const limitedHostRpc = (await import(moduleUrl.href)).createOciSdkHostRpc(loadSdk);
+  if (previous === undefined) {
+    delete process.env[environmentName];
+  } else {
+    process.env[environmentName] = previous;
+  }
+  response = { items: Array.from({ length: 5_000 }, () => "x".repeat(420)) };
+  await assert.rejects(
+    invoke(limitedHostRpc),
+    /response limit 2031616 bytes before serialization/
   );
 });
 

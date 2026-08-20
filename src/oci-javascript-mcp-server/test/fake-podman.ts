@@ -16,6 +16,7 @@ if (command === "run") {
     "--rm",
     "--interactive",
     "--pull", "never",
+    "--log-driver", "none",
     "--name", name,
     "--cpus", "1",
     "--memory", "512m",
@@ -29,6 +30,7 @@ if (command === "run") {
     "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m",
     "test-runner:dev"
   ]);
+  process.stderr.write("runner-internal-secret\n");
   await import("../src/sandbox-worker.ts");
 } else if (command === "rm") {
   assert.equal(args.length, 3);

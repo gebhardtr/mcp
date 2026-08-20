@@ -8,6 +8,7 @@ import { z } from "zod";
 import {
   appendCapped,
   formatError,
+  formatPublicOciError,
   isTimeoutError,
   MAX_CODE_BYTES,
   MAX_STDERR_BYTES,
@@ -48,6 +49,7 @@ type RpcRunState = {
   accepting: boolean;
   deadlineMs: number;
   inFlight: number;
+  pendingCalls: Set<Promise<Json>>;
   remainingCalls: number;
 };
 
@@ -70,6 +72,7 @@ export async function runJavaScript(
     accepting: true,
     deadlineMs,
     inFlight: 0,
+    pendingCalls: new Set(),
     remainingCalls: MAX_HOST_RPC_CALLS
   };
   const abortController = new AbortController();
@@ -81,7 +84,12 @@ export async function runJavaScript(
     execution = validateExecution(isolationProvider.run(code, {
       deadlineMs,
       signal: abortController.signal,
-      hostRpc: request => invokeHostRpc(options.hostRpc, rpcState, request),
+      hostRpc: request => invokeHostRpc(
+        options.hostRpc,
+        rpcState,
+        request,
+        abortController.signal
+      ),
       reflectionManifest
     }));
     const result = await withDeadline(
@@ -94,6 +102,8 @@ export async function runJavaScript(
       ? timeoutResult()
       : providerFailure(error);
   } finally {
+    const completedWithPendingCalls = outcome?.exitCode === 0
+      && rpcState.pendingCalls.size > 0;
     rpcState.accepting = false;
     abortController.abort();
     if (execution) {
@@ -101,6 +111,10 @@ export async function runJavaScript(
       if (cleanupError) {
         outcome = providerFailure(cleanupError, "isolation provider cleanup failed");
       }
+    }
+    await Promise.allSettled([...rpcState.pendingCalls]);
+    if (completedWithPendingCalls && outcome?.exitCode === 0) {
+      outcome = workerFailure("JavaScript completed with unawaited OCI calls");
     }
   }
 
@@ -209,7 +223,8 @@ function remainingDeadlineMs(deadlineMs: number): number {
 async function invokeHostRpc(
   hostRpc: HostRpcHandler,
   state: RpcRunState,
-  request: unknown
+  request: unknown,
+  signal: AbortSignal
 ): Promise<Json> {
   if (!validateRpcRequest(request)) {
     return rpcEnvelopeError("invalid OCI bridge request");
@@ -247,14 +262,19 @@ async function invokeHostRpc(
       throw new Error("sandbox run deadline exceeded");
     }
     const hostRpcPromise = Promise.resolve()
-      .then(() => hostRpc(request, remainingMs));
+      .then(() => hostRpc(request, signal));
+    state.pendingCalls.add(hostRpcPromise);
+    void hostRpcPromise.then(
+      () => state.pendingCalls.delete(hostRpcPromise),
+      () => state.pendingCalls.delete(hostRpcPromise)
+    );
     const value = await withDeadline(hostRpcPromise, remainingMs);
     if (!state.accepting) {
       return rpcEnvelopeError("sandbox run deadline exceeded");
     }
     return { ok: true, value };
   } catch (error) {
-    return rpcEnvelopeError(formatError(error));
+    return rpcEnvelopeError(formatPublicOciError(error));
   } finally {
     state.inFlight -= 1;
   }
@@ -291,20 +311,16 @@ function timeoutResult(): SandboxResult {
 }
 
 function providerFailure(
-  error: unknown,
+  _error: unknown,
   prefix = "isolation provider failed"
 ): SandboxResult {
-  return workerFailure(`${prefix}: ${formatError(error).message}`);
+  return workerFailure(prefix);
 }
 
-function workerFailure(message: string, stderr = ""): SandboxResult {
-  const error: JsonObject = { message };
-  if (stderr) {
-    error.cause = stderr;
-  }
+function workerFailure(message: string): SandboxResult {
   return {
     result: null,
-    error: error as { message: string } & JsonObject,
+    error: { message },
     stdout: "",
     stderr: "",
     exitCode: 1,

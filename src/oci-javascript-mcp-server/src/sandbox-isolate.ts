@@ -19,13 +19,11 @@ import { SANDBOX_BOOTSTRAP } from "./sandbox-prelude.ts";
 import type { Json, OciReflectionManifest, SandboxResult } from "./types.ts";
 
 type SandboxApi = {
-  drain: ivm.Reference<() => Promise<void>>;
   encodeLastResult: ivm.Reference<() => Json>;
   run: ivm.Reference<(code: string) => Promise<void>>;
 };
 
 type RunState = {
-  accepting: boolean;
   deadlineMs: number;
 };
 
@@ -45,7 +43,6 @@ export async function runJavaScriptInIsolate(
 
   const timeoutMs = normalizeTimeoutMs(options.timeoutSeconds);
   const state: RunState = {
-    accepting: true,
     deadlineMs: Date.now() + timeoutMs
   };
   const output = {
@@ -91,7 +88,6 @@ export async function runJavaScriptInIsolate(
     ) as ivm.Reference<Record<string, unknown>>;
 
     api = {
-      drain: await bootstrap.get("drain", { reference: true }) as ivm.Reference<() => Promise<void>>,
       encodeLastResult: await bootstrap.get("encodeLastResult", {
         reference: true
       }) as ivm.Reference<() => Json>,
@@ -111,7 +107,6 @@ export async function runJavaScriptInIsolate(
         }),
         evalTimeoutMs
       );
-      await drainHostRpc(api, state);
       const resultTimeoutMs = remainingRunMs(state);
       const result = await withDeadline(
         api.encodeLastResult.apply(undefined, [], {
@@ -126,7 +121,6 @@ export async function runJavaScriptInIsolate(
           `Sandbox result was ${resultBytes} bytes, exceeding result limit ${options.maxResultBytes} bytes`
         );
       }
-      await drainHostRpc(api, state);
       return {
         result,
         error: null,
@@ -136,7 +130,6 @@ export async function runJavaScriptInIsolate(
         timedOut: false
       };
     } catch (error) {
-      state.accepting = false;
       const timedOut = isTimeoutError(error);
       return {
         result: null,
@@ -148,8 +141,6 @@ export async function runJavaScriptInIsolate(
       };
     }
   } finally {
-    state.accepting = false;
-    api?.drain.release();
     api?.encodeLastResult.release();
     api?.run.release();
     isolate.dispose();
@@ -166,8 +157,8 @@ function dispatchHostRpc(
     try {
       const request = await requestReference.copy();
       result = await hostRpc(request);
-    } catch (error) {
-      result = { ok: false, error: formatError(error) };
+    } catch {
+      result = { ok: false, error: { message: "OCI call failed" } };
     }
 
     try {
@@ -186,20 +177,6 @@ function dispatchHostRpc(
       }
     }
   })();
-}
-
-async function drainHostRpc(
-  api: SandboxApi,
-  state: RunState
-): Promise<void> {
-  const remainingMs = remainingRunMs(state);
-  await withDeadline(
-    api.drain.apply(undefined, [], {
-      result: { promise: true, copy: true },
-      timeout: remainingMs
-    }),
-    remainingMs
-  );
 }
 
 function remainingRunMs(state: RunState): number {

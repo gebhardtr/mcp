@@ -13,7 +13,6 @@ import {
   encodeFrame,
   protocolMessage
 } from "./protocol.ts";
-import { formatError } from "./sandbox-common.ts";
 import { runJavaScriptInIsolate } from "./sandbox-isolate.ts";
 import type { Json, JsonObject, OciReflectionManifest } from "./types.ts";
 
@@ -170,9 +169,9 @@ function sendAndExit(type: string, fields: JsonObject, exitCode: number): void {
   );
 }
 
-function fatal(error: unknown): void {
+function fatal(_error: unknown): void {
   try {
-    send("protocol_error", { error: formatError(error) });
+    send("protocol_error", { error: { message: "sandbox protocol failure" } });
   } catch {
     // The channel may already be unusable.
   }

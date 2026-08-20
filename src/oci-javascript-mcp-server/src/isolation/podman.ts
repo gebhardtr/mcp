@@ -47,6 +47,7 @@ export class PodmanIsolationProvider implements IsolationProvider {
       "--rm",
       "--interactive",
       "--pull", "never",
+      "--log-driver", "none",
       "--name", name,
       "--cpus", "1",
       "--memory", "512m",

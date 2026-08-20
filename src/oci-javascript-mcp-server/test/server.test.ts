@@ -36,6 +36,17 @@ test("stdio server advertises and executes its MCP tools", async () => {
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map(tool => tool.name), ["run_javascript", "discover_oci"]);
 
+    const oversizedResult = await client.callTool({
+      name: "run_javascript",
+      arguments: { code: "x".repeat(1024 * 1024 + 1), timeout: 10 }
+    });
+    assert.equal(oversizedResult.isError, true);
+    const oversizedContent = oversizedResult.content as Array<{ text: string }>;
+    assert.match(
+      oversizedContent[0].text,
+      /JavaScript code exceeds 1048576 bytes/
+    );
+
     const runResult = await client.callTool({
       name: "run_javascript",
       arguments: { code: "40 + 2;", timeout: 10 }
@@ -48,6 +59,7 @@ test("stdio server advertises and executes its MCP tools", async () => {
       exit_code: 0,
       timed_out: false
     });
+    assert.equal(JSON.stringify(runResult).includes("runner-internal-secret"), false);
 
     const discoveryResult = await client.callTool({
       name: "discover_oci",

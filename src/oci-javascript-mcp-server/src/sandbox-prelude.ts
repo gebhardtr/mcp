@@ -33,14 +33,12 @@ const __objectFreeze = Object.freeze;
 const __objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const __objectKeys = Object.keys;
 const __promise = Promise;
-const __promiseAllSettled = Promise.allSettled.bind(Promise);
 const __proxy = Proxy;
 const __reflectOwnKeys = Reflect.ownKeys;
 const __set = Set;
 const __string = String;
 const __uint8Array = Uint8Array;
 const __weakSet = WeakSet;
-const __ociRpcPending = new __set();
 const __serviceProxyCache = new __map();
 const __clientProxyCache = new __map();
 const __ociRegionIdPattern = /^[a-z][a-z0-9-]*-[a-z0-9-]+-[0-9]+$/;
@@ -253,7 +251,7 @@ async function __ociRpc(operation, payload) {
     operation,
     payload
   });
-  const promise = new __promise((resolve, reject) => {
+  const envelope = await new __promise((resolve, reject) => {
     try {
       __hostRpc.applyIgnored(undefined, [request, resolve], {
         arguments: { reference: true }
@@ -262,16 +260,10 @@ async function __ociRpc(operation, payload) {
       reject(error);
     }
   });
-  __ociRpcPending.add(promise);
-  try {
-    const envelope = await promise;
-    if (!envelope || envelope.ok !== true) {
-      throw __ociErrorFromEnvelope(envelope && envelope.error);
-    }
-    return __ociFromWire(envelope.value);
-  } finally {
-    __ociRpcPending.delete(promise);
+  if (!envelope || envelope.ok !== true) {
+    throw __ociErrorFromEnvelope(envelope && envelope.error);
   }
+  return __ociFromWire(envelope.value);
 }
 
 function __ociErrorFromEnvelope(error) {
@@ -690,11 +682,6 @@ __objectDefineProperty(globalThis, "oci", {
 });
 
 return __objectFreeze({
-  drain: async function __ociDrainPending() {
-    while (__ociRpcPending.size > 0) {
-      await __promiseAllSettled(__arrayFrom(__ociRpcPending));
-    }
-  },
   encodeLastResult: function __ociEncodeLastResult() {
     return __ociToWire(globalThis._);
   },

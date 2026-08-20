@@ -4,7 +4,7 @@
  * https://oss.oracle.com/licenses/upl.
  */
 
-import type { Json, JsonObject, SandboxError } from "./types.ts";
+import type { Json, SandboxError } from "./types.ts";
 
 export const MAX_CODE_BYTES = 1024 * 1024;
 export const DEFAULT_TIMEOUT_SECONDS = 30;
@@ -12,6 +12,8 @@ export const MIN_TIMEOUT_SECONDS = 1;
 export const MAX_TIMEOUT_SECONDS = 120;
 export const MAX_STDOUT_BYTES = 1024 * 1024;
 export const MAX_STDERR_BYTES = 1024 * 1024;
+
+export class PublicError extends Error {}
 
 export function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   if (timeoutMs <= 0) {
@@ -51,8 +53,6 @@ export function isTimeoutError(error: unknown): boolean {
 }
 
 export function formatError(error: unknown): SandboxError {
-  const response = readObjectField(error, "response");
-  const body = readField(error, "body") ?? readField(response, "body") ?? readField(response, "data");
   const details: SandboxError = {
     message: errorMessage(error)
   };
@@ -65,9 +65,7 @@ export function formatError(error: unknown): SandboxError {
     "opcRequestId",
     "requestId",
     "targetService",
-    "operationName",
-    "timestamp",
-    "requestEndpoint"
+    "operationName"
   ]) {
     const value = jsonScalar(readField(error, key));
     if (value !== undefined) {
@@ -75,30 +73,28 @@ export function formatError(error: unknown): SandboxError {
     }
   }
 
-  const responseStatusCode = jsonScalar(
+  return details;
+}
+
+export function formatPublicOciError(error: unknown): SandboxError {
+  if (error instanceof PublicError) {
+    return { message: error.message };
+  }
+  const details = formatError(error);
+  details.message = "OCI call failed";
+  delete details.name;
+
+  const response = readObjectField(error, "response");
+  const responseStatus = jsonScalar(
     readField(response, "statusCode") ?? readField(response, "status")
   );
-  if (responseStatusCode !== undefined) {
-    details.responseStatusCode = responseStatusCode;
+  if (details.statusCode === undefined && responseStatus !== undefined) {
+    details.statusCode = responseStatus;
   }
-
   const responseRequestId = headerValue(readField(response, "headers"), "opc-request-id");
   if (responseRequestId && details.opcRequestId === undefined) {
     details.opcRequestId = responseRequestId;
   }
-
-  const bodyValue = jsonErrorBody(body);
-  if (bodyValue !== undefined) {
-    details.responseBody = bodyValue;
-  }
-
-  const cause = readField(error, "cause");
-  if (cause !== undefined && cause !== error) {
-    details.cause = cause instanceof Error
-      ? formatError(cause)
-      : jsonErrorBody(cause) ?? errorMessage(cause);
-  }
-
   return details;
 }
 
@@ -155,25 +151,6 @@ function jsonScalar(value: unknown): Json | undefined {
     return value.toString();
   }
   return undefined;
-}
-
-function jsonErrorBody(value: unknown): Json | undefined {
-  const scalar = jsonScalar(value);
-  if (scalar !== undefined) {
-    return scalar;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-
-  const result: JsonObject = {};
-  for (const key of ["code", "message", "details"]) {
-    const scalarField = jsonScalar(readField(value, key));
-    if (scalarField !== undefined) {
-      result[key] = scalarField;
-    }
-  }
-  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function headerValue(headers: unknown, key: string): string | undefined {

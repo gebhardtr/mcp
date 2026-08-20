@@ -9,9 +9,11 @@ import test from "node:test";
 import {
   appendCapped,
   formatError,
+  formatPublicOciError,
   isTimeoutError,
   normalizeTimeoutMs,
   positiveIntegerEnv,
+  PublicError,
   withDeadline
 } from "../src/sandbox-common.ts";
 
@@ -41,17 +43,21 @@ test("sandbox common helpers cap UTF-8 output", () => {
   assert.equal(Buffer.byteLength(appendCapped("ab", "cdef", 4), "utf8"), 4);
 });
 
-test("sandbox common helpers retain safe OCI error details", () => {
+test("sandbox common helpers keep only allowlisted public OCI error details", () => {
   const cause = new Error("socket closed");
   Object.defineProperty(cause, "code", { value: "ECONNRESET" });
   const error = new Error("request failed", { cause });
   Object.assign(error, {
     statusCode: 400,
     serviceCode: "InvalidParameter",
+    requestEndpoint: "https://internal.example/signed?token=secret",
     response: {
       status: 400,
-      headers: new Map([["opc-request-id", "request-1"]]),
-      body: { code: "InvalidParameter", message: "bad value", ignored: "secret" }
+      headers: new Map([
+        ["opc-request-id", "request-1"],
+        ["authorization", "secret"]
+      ]),
+      body: { code: "InvalidParameter", message: "secret response body" }
     }
   });
 
@@ -59,12 +65,27 @@ test("sandbox common helpers retain safe OCI error details", () => {
     message: "request failed",
     name: "Error",
     statusCode: 400,
-    serviceCode: "InvalidParameter",
-    responseStatusCode: 400,
-    opcRequestId: "request-1",
-    responseBody: { code: "InvalidParameter", message: "bad value" },
-    cause: { message: "socket closed", name: "Error", code: "ECONNRESET" }
+    serviceCode: "InvalidParameter"
   });
+  assert.deepEqual(formatPublicOciError(error), {
+    message: "OCI call failed",
+    statusCode: 400,
+    serviceCode: "InvalidParameter",
+    opcRequestId: "request-1",
+  });
+  assert.deepEqual(formatPublicOciError(new PublicError("safe broker guidance")), {
+    message: "safe broker guidance"
+  });
+  const publicText = JSON.stringify(formatPublicOciError(error));
+  for (const secret of [
+    "request failed",
+    "socket closed",
+    "internal.example",
+    "secret response body",
+    "authorization"
+  ]) {
+    assert.equal(publicText.includes(secret), false);
+  }
   assert.deepEqual(formatError({ name: "NamedFailure" }), { message: "NamedFailure", name: "NamedFailure" });
   assert.deepEqual(formatError({}), { message: "OCI call failed" });
   assert.deepEqual(formatError("plain failure"), { message: "plain failure" });

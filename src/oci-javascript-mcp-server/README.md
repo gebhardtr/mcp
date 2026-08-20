@@ -59,7 +59,8 @@ fixed arguments and never through a shell. There is no process fallback.
 
 Runs `code` with an optional timeout of 1–120 seconds (default 30). The final
 expression becomes `result`; logs, errors, exit status, and timeout state are
-returned separately.
+returned separately. Every OCI call must be awaited; the host aborts outstanding
+calls and rejects a run that finishes while OCI work is still pending.
 
 Use the injected binding like the OCI JavaScript SDK:
 
@@ -100,8 +101,8 @@ MCP client
                  <-> bounded framed pipe <-> OCI broker
 ```
 
-The host owns credentials, OCI clients, validation, deadlines, budgets, result
-sanitization, policy enforcement, and teardown. The container and isolate
+The host owns credentials, OCI clients, request validation, deadlines, budgets,
+bounded result encoding, and teardown. The container and isolate
 receive reflection metadata and a narrow RPC bridge, but no credential or
 signer. The `IsolationProvider` seam keeps these host controls independent of
 the runtime backend.
@@ -116,6 +117,8 @@ the runtime backend.
 - Credentials, signers, SDK clients, and HTTPS remain in the trusted host.
 - The host validates each request and enforces deadlines, message and result
   sizes, call counts, concurrency, cancellation, and teardown.
+- OCI failures expose only status, service code, operation, and request identifiers;
+  raw SDK details and runner-process stderr are not returned.
 
 The nested `isolated-vm` boundary reduces exposure inside the runner, but an
 `isolated-vm`, V8, native-addon, container-runtime, or shared-kernel compromise

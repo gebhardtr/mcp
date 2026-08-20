@@ -18,7 +18,6 @@ const MAX_CONCURRENT_TOOL_CALLS = positiveIntegerEnv(
   "OCI_JAVASCRIPT_MAX_CONCURRENT_TOOL_CALLS",
   4
 );
-const MAX_QUEUED_TOOL_CALLS = positiveIntegerEnv("OCI_JAVASCRIPT_MAX_QUEUED_TOOL_CALLS", 64);
 const isolationProvider = new PodmanIsolationProvider({
   cliPath: process.env.OCI_JAVASCRIPT_PODMAN_CLI,
   image: process.env.OCI_JAVASCRIPT_PODMAN_IMAGE
@@ -29,7 +28,6 @@ const DEFAULT_TIMEOUT_SECONDS = 30;
 const MIN_TIMEOUT_SECONDS = 1;
 const MAX_TIMEOUT_SECONDS = 120;
 let activeToolCalls = 0;
-const queuedToolCalls: Array<() => void> = [];
 
 const server = new McpServer({
   name: "oci-javascript-mcp-server",
@@ -37,6 +35,7 @@ const server = new McpServer({
 }, {
   instructions: (
     "Run one complete JavaScript script against the injected OCI binding. "
+    + "Await every OCI call. "
     + "Leave the result value as the final expression; "
     + "stdout/stderr are for logs. "
     + "Uncaught JavaScript or OCI errors are returned in error. "
@@ -51,7 +50,7 @@ server.registerTool(
     description: (
       "Primary tool for Oracle Cloud Infrastructure (OCI) tasks. "
       + "Run one complete JavaScript script in a fresh sandbox with an injected "
-      + "`oci` binding. Leave the result value as the final expression; "
+      + "`oci` binding. Await every OCI call and leave the result value as the final expression; "
       + "stdout/stderr are for incidental logs. Try straightforward code first; "
       + "uncaught JavaScript or OCI errors are returned in `error`; "
       + "use OCI list limit/page tokens for pagination, and use `discover_oci` only after "
@@ -139,29 +138,15 @@ function jsonToolResult(result: JsonObject): CallToolResult {
 }
 
 async function limitToolCall<T>(callback: () => Promise<T>): Promise<T> {
-  await acquireToolCall();
+  if (activeToolCalls >= MAX_CONCURRENT_TOOL_CALLS) {
+    throw new Error(`too many concurrent tool calls (${MAX_CONCURRENT_TOOL_CALLS})`);
+  }
+  activeToolCalls += 1;
   try {
     return await callback();
   } finally {
     activeToolCalls -= 1;
-    queuedToolCalls.shift()?.();
   }
-}
-
-function acquireToolCall(): Promise<void> {
-  if (activeToolCalls < MAX_CONCURRENT_TOOL_CALLS) {
-    activeToolCalls += 1;
-    return Promise.resolve();
-  }
-  if (queuedToolCalls.length >= MAX_QUEUED_TOOL_CALLS) {
-    throw new Error(`too many queued tool calls (${MAX_QUEUED_TOOL_CALLS})`);
-  }
-  return new Promise(resolve => {
-    queuedToolCalls.push(() => {
-      activeToolCalls += 1;
-      resolve();
-    });
-  });
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {

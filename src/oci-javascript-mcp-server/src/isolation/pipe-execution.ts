@@ -12,7 +12,11 @@ import {
   encodeFrame,
   protocolMessage
 } from "../protocol.ts";
-import { appendCapped, formatError, MAX_STDERR_BYTES, MAX_STDOUT_BYTES } from "../sandbox-common.ts";
+import {
+  appendCapped,
+  MAX_STDERR_BYTES,
+  MAX_STDOUT_BYTES
+} from "../sandbox-common.ts";
 import type {
   IsolationExecution,
   IsolationRunOptions,
@@ -103,22 +107,20 @@ export function startPipeExecution(
             workerCompleted = true;
             finish(value, stop);
           }
-        }).catch(error => fail(`sandbox protocol failed: ${formatError(error).message}`));
+        }).catch(() => fail("sandbox protocol failed"));
       }
-    } catch (error) {
-      fail(`sandbox protocol failed: ${formatError(error).message}`);
+    } catch {
+      fail("sandbox protocol failed");
     }
   });
-  child.stderr.on("data", chunk => {
-    stderr = appendCapped(stderr, String(chunk), MAX_STDERR_BYTES);
-  });
-  child.once("error", error => fail(`sandbox runner failed: ${error.message}`, false));
+  child.stderr.resume();
+  child.once("error", () => fail("sandbox runner failed", false));
   child.once("close", (exitCode, signal) => {
     try {
       decoder.end();
-    } catch (error) {
+    } catch {
       if (!settled) {
-        fail(`sandbox protocol failed: ${formatError(error).message}`, false);
+        fail("sandbox protocol failed", false);
         return;
       }
     }
@@ -227,8 +229,8 @@ async function handleWorkerMessage(
     let rpcResult: Json;
     try {
       rpcResult = await input.hostRpc(copyToPlainJson(message.request) as JsonObject);
-    } catch (error) {
-      rpcResult = { ok: false, error: formatError(error) };
+    } catch {
+      rpcResult = { ok: false, error: { message: "OCI call failed" } };
     }
     send(child, "rpc_result", { id: message.id, result: rpcResult });
     return;

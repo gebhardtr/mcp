@@ -19,21 +19,21 @@ import type {
   OciReflectionManifest
 } from "./types.ts";
 import { fromJson, toJson } from "./json.ts";
+import { DEFAULT_DECODE_LIMITS, DEFAULT_MAX_FRAME_BYTES } from "./protocol.ts";
+import { PublicError } from "./sandbox-common.ts";
 
 const require = createRequire(import.meta.url);
 const packageJson = require("../package.json") as { name?: unknown; version?: unknown };
 
 const ADDITIONAL_USER_AGENT = additionalUserAgent(packageJson);
-const MAX_HOST_RPC_RESPONSE_BYTES = positiveIntegerEnv(
-  "OCI_JAVASCRIPT_MAX_HOST_RPC_RESPONSE_BYTES",
-  1024 * 1024
+const MAX_HOST_RPC_RESPONSE_BYTES = Math.min(
+  positiveIntegerEnv("OCI_JAVASCRIPT_MAX_HOST_RPC_RESPONSE_BYTES", 1024 * 1024),
+  DEFAULT_MAX_FRAME_BYTES - 64 * 1024
 );
-const MAX_SANITIZE_DEPTH = 80;
+const MAX_HOST_RPC_RESPONSE_NODES = DEFAULT_DECODE_LIMITS.maxNodes;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const REGION_ID_PATTERN = /^[a-z][a-z0-9-]*-[a-z0-9-]+-[0-9]+$/;
 const LIST_OPERATION_PATTERN = /^(list|search)/i;
-const SDK_CREDENTIAL_FIELD_PATTERN =
-  /^(authenticationDetailsProvider|authProvider|signer|privateKey|sessionToken|securityToken)$/i;
 const MAX_DISCOVERY_MODEL_DEPTH = 2;
 
 type SdkBundle = {
@@ -44,7 +44,7 @@ type SdkBundle = {
 export type OciSdkLoader = () => SdkBundle;
 
 type OciClientConfiguration = {
-  circuitBreaker?: unknown;
+  httpOptions?: { signal: AbortSignal };
 };
 
 type FieldDiscovery = {
@@ -56,6 +56,11 @@ type FieldDiscovery = {
 
 type ModelDiscovery = {
   fields: FieldDiscovery[];
+};
+
+type ResponseBudget = {
+  bytes: number;
+  nodes: number;
 };
 
 function additionalUserAgent(metadata: { name?: unknown; version?: unknown }): string {
@@ -73,9 +78,12 @@ function additionalUserAgent(metadata: { name?: unknown; version?: unknown }): s
 }
 
 export function createOciSdkHostRpc(loadSdk: OciSdkLoader = loadDefaultSdk): HostRpcHandler {
-  return async (request: HostRpcRequest, timeoutMs?: number): Promise<Json> => {
+  return async (
+    request: HostRpcRequest,
+    signal?: AbortSignal
+  ): Promise<Json> => {
     if (request.binding !== "oracle" || request.namespace !== "oci") {
-      throw new Error(`Unsupported host RPC binding ${request.binding}/${request.namespace}`);
+      throw new PublicError(`Unsupported host RPC binding ${request.binding}/${request.namespace}`);
     }
 
     if (request.operation === "config") {
@@ -85,10 +93,10 @@ export function createOciSdkHostRpc(loadSdk: OciSdkLoader = loadDefaultSdk): Hos
       return discover(loadSdk, request.payload as OciDiscoverPayload);
     }
     if (request.operation === "invoke") {
-      return invoke(loadSdk, request.payload as OciInvokePayload, timeoutMs);
+      return invoke(loadSdk, request.payload as OciInvokePayload, signal);
     }
 
-    throw new Error(`Unsupported OCI host RPC operation ${request.operation}`);
+    throw new PublicError(`Unsupported OCI host RPC operation ${request.operation}`);
   };
 }
 
@@ -165,25 +173,25 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
 async function invoke(
   loadSdk: OciSdkLoader,
   payload: OciInvokePayload,
-  timeoutMs?: number
+  signal?: AbortSignal
 ): Promise<Json> {
   validateIdentifier(payload.service, "service");
   validateClientPayload(payload.client);
   validateIdentifier(payload.operation, "operation");
 
-  const { sdk, common } = loadSdk();
+  const { sdk } = loadSdk();
   const serviceModule = sdk[payload.service];
   if (!serviceModule || typeof serviceModule !== "object") {
-    throw new Error(`Unknown OCI SDK service '${payload.service}'`);
+    throw new PublicError(`Unknown OCI SDK service '${payload.service}'`);
   }
 
   const ClientClass = serviceModule[payload.client.name];
   if (typeof ClientClass !== "function") {
-    throw new Error(`Unknown OCI SDK client '${payload.service}.${payload.client.name}'`);
+    throw new PublicError(`Unknown OCI SDK client '${payload.service}.${payload.client.name}'`);
   }
   const operations = operationNames(payload.service, ClientClass);
   if (!operations.includes(payload.operation)) {
-    throw new Error(unknownOperationMessage(
+    throw new PublicError(unknownOperationMessage(
       payload.service,
       payload.client.name,
       payload.operation,
@@ -193,7 +201,7 @@ async function invoke(
 
   const provider = authenticationProvider(loadSdk);
   applyClientOptions(provider, payload.client.options);
-  const clientConfiguration = createClientConfiguration(common, timeoutMs);
+  const clientConfiguration = createClientConfiguration(signal);
   const client = new ClientClass({
     authenticationDetailsProvider: provider,
     additionalUserAgent: ADDITIONAL_USER_AGENT
@@ -201,7 +209,7 @@ async function invoke(
   try {
     const operation = client[payload.operation];
     if (typeof operation !== "function") {
-      throw new Error(unknownOperationMessage(
+      throw new PublicError(unknownOperationMessage(
         payload.service,
         payload.client.name,
         payload.operation,
@@ -211,10 +219,15 @@ async function invoke(
 
     const request = decodeRequest(payload.request ?? {});
     const response = await operation.call(client, request);
-    const encoded = toJson(stripHttpTransportArtifacts(response, new WeakSet<object>(), 0));
+    const encoded = encodeOciResponse(
+      response,
+      new WeakSet<object>(),
+      0,
+      { bytes: 0, nodes: 0 }
+    );
     const encodedBytes = Buffer.byteLength(JSON.stringify(encoded), "utf8");
     if (encodedBytes > MAX_HOST_RPC_RESPONSE_BYTES) {
-      throw new Error(tooLargeMessage(payload, encodedBytes));
+      throw new PublicError(tooLargeMessage(payload, encodedBytes));
     }
     return encoded;
   } finally {
@@ -234,7 +247,7 @@ function discover(loadSdk: OciSdkLoader, payload: OciDiscoverPayload): Json {
   validateIdentifier(payload.service, "service");
   const serviceModule = sdk[payload.service];
   if (!serviceModule || typeof serviceModule !== "object") {
-    throw new Error(`Unknown OCI SDK service '${payload.service}'`);
+    throw new PublicError(`Unknown OCI SDK service '${payload.service}'`);
   }
 
   const clients = clientNames(serviceModule);
@@ -246,7 +259,7 @@ function discover(loadSdk: OciSdkLoader, payload: OciDiscoverPayload): Json {
   validateIdentifier(payload.client, "client");
   const ClientClass = serviceModule[payload.client];
   if (typeof ClientClass !== "function") {
-    throw new Error(`Unknown OCI SDK client '${payload.service}.${payload.client}'`);
+    throw new PublicError(`Unknown OCI SDK client '${payload.service}.${payload.client}'`);
   }
 
   const operations = operationNames(payload.service, ClientClass);
@@ -262,7 +275,7 @@ function discover(loadSdk: OciSdkLoader, payload: OciDiscoverPayload): Json {
 
   validateIdentifier(payload.operation, "operation");
   if (!operations.includes(payload.operation)) {
-    throw new Error(unknownOperationMessage(
+    throw new PublicError(unknownOperationMessage(
       payload.service,
       payload.client,
       payload.operation,
@@ -570,7 +583,7 @@ function authenticationProvider(loadSdk: OciSdkLoader): any {
   const Provider = sdk.ConfigFileAuthenticationDetailsProvider
     ?? common.ConfigFileAuthenticationDetailsProvider;
   if (typeof Provider !== "function") {
-    throw new Error("OCI JavaScript SDK authentication provider is unavailable");
+    throw new PublicError("OCI JavaScript SDK authentication provider is unavailable");
   }
   return new Provider(configFile, profile);
 }
@@ -610,7 +623,7 @@ function readProfile(configFile: string, profile: string): Record<string, string
 function decodeRequest(request: JsonObject): Record<string, any> {
   const decoded = fromJson(request);
   if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
-    throw new Error("OCI request must decode to an object");
+    throw new PublicError("OCI request must decode to an object");
   }
   return decoded as Record<string, any>;
 }
@@ -637,12 +650,12 @@ function firstNonEmptyString(...values: unknown[]): string | null {
 
 function validateClientPayload(client: unknown): asserts client is OciInvokePayload["client"] {
   if (!client || typeof client !== "object" || Array.isArray(client)) {
-    throw new Error("Invalid OCI client payload");
+    throw new PublicError("Invalid OCI client payload");
   }
   const keys = Object.keys(client);
   for (const key of keys) {
     if (key !== "name" && key !== "options") {
-      throw new Error(`Unsupported OCI client field '${key}'`);
+      throw new PublicError(`Unsupported OCI client field '${key}'`);
     }
   }
   validateIdentifier((client as { name?: unknown }).name, "client");
@@ -654,11 +667,11 @@ function validateClientOptions(options: unknown): asserts options is OciInvokePa
     return;
   }
   if (!options || typeof options !== "object" || Array.isArray(options)) {
-    throw new Error("OCI client options must be an object");
+    throw new PublicError("OCI client options must be an object");
   }
   for (const key of Object.keys(options)) {
     if (key !== "region") {
-      throw new Error(
+      throw new PublicError(
         `Unsupported OCI client option '${key}'. Client options only support region; `
         + "pass tenancyId, compartmentId, and other OCI values in operation request objects."
       );
@@ -666,7 +679,7 @@ function validateClientOptions(options: unknown): asserts options is OciInvokePa
   }
   const region = (options as { region?: unknown }).region;
   if (region !== undefined && (typeof region !== "string" || !REGION_ID_PATTERN.test(region))) {
-    throw new Error(`Invalid OCI client option region '${String(region)}'`);
+    throw new PublicError(`Invalid OCI client option region '${String(region)}'`);
   }
 }
 
@@ -675,32 +688,18 @@ function applyClientOptions(provider: any, options: OciInvokePayload["client"]["
     return;
   }
   if (typeof provider?.setRegion !== "function") {
-    throw new Error("OCI authentication provider does not support per-client region selection");
+    throw new PublicError("OCI authentication provider does not support per-client region selection");
   }
   provider.setRegion(options.region);
 }
 
-function createClientConfiguration(
-  common: Record<string, any>,
-  timeout?: number
-): OciClientConfiguration | undefined {
-  const configuration: OciClientConfiguration = {};
-  if (
-    timeout !== undefined
-    && Number.isFinite(timeout)
-    && timeout > 0
-    && typeof common.CircuitBreaker === "function"
-  ) {
-    configuration.circuitBreaker = new common.CircuitBreaker({
-      timeout: Math.max(1, Math.ceil(timeout))
-    });
-  }
-  return Object.keys(configuration).length > 0 ? configuration : undefined;
+function createClientConfiguration(signal?: AbortSignal): OciClientConfiguration | undefined {
+  return signal ? { httpOptions: { signal } } : undefined;
 }
 
 function validateIdentifier(value: unknown, name: string): asserts value is string {
   if (typeof value !== "string" || !IDENTIFIER_PATTERN.test(value)) {
-    throw new Error(`Invalid OCI ${name} '${String(value)}'`);
+    throw new PublicError(`Invalid OCI ${name} '${String(value)}'`);
   }
 }
 
@@ -715,25 +714,49 @@ function tooLargeMessage(payload: OciInvokePayload, size: number): string {
   return `${base} Narrow the request or return only the fields needed.`;
 }
 
-function stripHttpTransportArtifacts(
+function encodeOciResponse(
   value: unknown,
   seen: WeakSet<object>,
-  depth: number
-): unknown {
-  if (depth > MAX_SANITIZE_DEPTH) {
-    return "[MaxDepth]";
+  depth: number,
+  budget: ResponseBudget
+): Json {
+  consumeResponseBudget(value, budget);
+  if (depth > DEFAULT_DECODE_LIMITS.maxDepth - 2) {
+    throw new PublicError(
+      `OCI response exceeded depth limit ${DEFAULT_DECODE_LIMITS.maxDepth - 2}`
+    );
   }
-  if (!value || typeof value !== "object") {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string" || typeof value === "boolean") {
     return value;
   }
-  if (
-    value instanceof Date
-    || value instanceof Uint8Array
-    || value instanceof Map
-    || value instanceof Set
-    || value instanceof Error
-  ) {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new PublicError("OCI response contained a non-finite number");
+    }
     return value;
+  }
+  if (typeof value === "bigint") {
+    const encoded = value.toString();
+    consumeResponseBytes(budget, Buffer.byteLength(encoded, "utf8"));
+    return wireValue("bigint", { value: encoded });
+  }
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new PublicError(`OCI response contained unsupported ${typeof value} value`);
+  }
+  if (value instanceof Date) {
+    return wireValue("datetime", { value: value.toISOString() });
+  }
+  if (value instanceof Uint8Array) {
+    return wireValue("bytes", {
+      encoding: "base64",
+      value: Buffer.from(value).toString("base64")
+    });
+  }
+  if (value instanceof Map || value instanceof Set || value instanceof Error) {
+    throw new PublicError(`OCI response contained unsupported ${value.constructor.name} value`);
   }
   if (seen.has(value)) {
     return "[Circular]";
@@ -742,15 +765,24 @@ function stripHttpTransportArtifacts(
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return value.map(item => stripHttpTransportArtifacts(item, seen, depth + 1));
+      if (value.length > DEFAULT_DECODE_LIMITS.maxArrayLength) {
+        throw new PublicError(
+          `OCI response array exceeded length limit ${DEFAULT_DECODE_LIMITS.maxArrayLength}. `
+          + "Narrow the request or use pagination."
+        );
+      }
+      const result: Json[] = [];
+      for (const item of value) {
+        result.push(encodeOciResponse(item, seen, depth + 1, budget));
+      }
+      return result;
     }
 
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (SDK_CREDENTIAL_FIELD_PATTERN.test(key) || isSdkTransportField(key, item)) {
-        continue;
-      }
-      result[key] = stripHttpTransportArtifacts(item, seen, depth + 1);
+    const result: Record<string, Json> = {};
+    for (const key of Object.keys(value)) {
+      consumeResponseBytes(budget, Buffer.byteLength(key, "utf8"));
+      const item = (value as Record<string, unknown>)[key];
+      result[key] = encodeOciResponse(item, seen, depth + 1, budget);
     }
     return result;
   } finally {
@@ -758,26 +790,40 @@ function stripHttpTransportArtifacts(
   }
 }
 
-function isSdkTransportField(key: string, value: unknown): boolean {
-  if (!value || typeof value !== "object") {
-    return false;
+function consumeResponseBudget(value: unknown, budget: ResponseBudget): void {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_HOST_RPC_RESPONSE_NODES) {
+    throw new PublicError(
+      `OCI response exceeded traversal node limit ${MAX_HOST_RPC_RESPONSE_NODES}. `
+      + "Narrow the request or use pagination."
+    );
   }
-  if (key === "httpRequest" || key === "httpResponse") {
-    return true;
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new PublicError(`OCI response contained unsupported ${typeof value} value`);
   }
-  return (key === "request" || key === "response") && looksLikeHttpTransport(value);
+  if (typeof value === "string") {
+    consumeResponseBytes(budget, Buffer.byteLength(value, "utf8"));
+  } else if (value instanceof Uint8Array) {
+    consumeResponseBytes(budget, Math.ceil(value.byteLength / 3) * 4);
+  }
 }
 
-function looksLikeHttpTransport(value: object): boolean {
-  const keys = new Set(Object.keys(value).map(key => key.toLowerCase()));
-  return keys.has("headers")
-    && (
-      keys.has("method")
-      || keys.has("uri")
-      || keys.has("url")
-      || keys.has("status")
-      || keys.has("body")
+function wireValue(typeName: string, fields: Record<string, Json>): JsonObject {
+  return { __oci_wire_type: typeName, ...fields };
+}
+
+function consumeResponseBytes(
+  budget: ResponseBudget,
+  bytes: number
+): void {
+  budget.bytes += bytes;
+  if (budget.bytes > MAX_HOST_RPC_RESPONSE_BYTES) {
+    throw new PublicError(
+      `OCI response was too large, exceeding response limit `
+      + `${MAX_HOST_RPC_RESPONSE_BYTES} bytes before serialization. `
+      + "Pass a smaller limit or narrow the request."
     );
+  }
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {
