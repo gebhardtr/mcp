@@ -1,0 +1,29 @@
+id: 'repository'
+
+fileGroups:
+  pythonSources:
+    - '**/*.py'
+
+tasks:
+  lint:
+    description: 'Checks repository Python source with Ruff'
+    command: 'uv tool run ruff check .'
+    toolchains:
+      - 'unstable_python'
+      - 'unstable_uv'
+    inputs:
+      - '@group(pythonSources)'
+      - 'ruff.toml'
+      - 'requirements-dev.txt'
+
+  format:
+    description: 'Formats repository Python source with Ruff'
+    command: 'uv tool run ruff format .'
+    toolchains:
+      - 'unstable_python'
+      - 'unstable_uv'
+    inputs:
+      - '@group(pythonSources)'
+      - 'ruff.toml'
+      - 'requirements-dev.txt'
+    preset: 'utility'
