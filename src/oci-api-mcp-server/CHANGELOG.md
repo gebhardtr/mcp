@@ -8,6 +8,7 @@
   supporting compound actions like `bulk-delete`.
 - Prevented the denylist generator from following destination symlinks when writing files.
 - Restricted execution to OCI CLI 3.89.3 installed in the MCP server environment.
+- Excluded development artifacts, local configuration, and container build files from source-distribution packages.
 
 ## 2.1.4
 
