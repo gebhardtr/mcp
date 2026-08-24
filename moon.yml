@@ -1,4 +1,4 @@
-id: 'repository'
+id: 'root'
 
 fileGroups:
   pythonSources:
