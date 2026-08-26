@@ -25,9 +25,8 @@ jobs:
           npx --yes --ignore-scripts --package="@moonrepo/cli@$moon_version" -- \
             moon ci --force root:lint :lock-check :install-check \
               oci-javascript-mcp-server:ci
-
-      - name: Combine coverage reports
-        run: make combine-coverage
+          npx --yes --ignore-scripts --package="@moonrepo/cli@$moon_version" -- \
+            moon run --force root:combine-coverage
 
       - name: Upload combined coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
