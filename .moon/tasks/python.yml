@@ -39,6 +39,8 @@ tasks:
       - '--cov-branch'
       - '--cov-report=html'
       - '--cov-report=term-missing'
+    env:
+      COVERAGE_FILE: '$workspaceRoot/.coverage.$project'
     inputs:
       - '@group(sources)'
       - '@group(tests)'
@@ -52,7 +54,7 @@ tasks:
           - '!oracle_mcp_common/tests/**/*'
           - 'pyproject.toml'
     outputs:
-      - '.coverage'
+      - '/.coverage.$project'
       - 'htmlcov/**/*'
 
   build:
@@ -62,3 +64,12 @@ tasks:
       - '@group(buildFiles)'
     outputs:
       - 'dist/**/*'
+
+  install-check:
+    description: 'Verifies that the project can be installed'
+    command: 'uv pip install .'
+    deps:
+      - target: 'test'
+      - target: 'build'
+    options:
+      cache: false
