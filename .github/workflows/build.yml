@@ -23,10 +23,10 @@ jobs:
           moon_version=$(sed -n 's/^moon = "=\([0-9][0-9.]*\)"$/\1/p' .prototools)
           test -n "$moon_version"
           npx --yes --ignore-scripts --package="@moonrepo/cli@$moon_version" -- \
-            moon ci --force root:lint :lock-check :install-check \
+            moon run root:lint :lock-check :install-check \
               oci-javascript-mcp-server:ci
           npx --yes --ignore-scripts --package="@moonrepo/cli@$moon_version" -- \
-            moon run --force root:combine-coverage
+            moon run root:combine-coverage
 
       - name: Upload combined coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
