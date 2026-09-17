@@ -13,8 +13,8 @@ access, environment variables, or a network API.
 
 ## Quick start
 
-Requires Node.js 26 or newer, Podman, and an OCI SDK configuration. A native
-build toolchain is also needed when installing `isolated-vm` on the host.
+Requires Node.js 26 or newer, rootless Podman, and an OCI SDK configuration. A
+native build toolchain is also needed when installing `isolated-vm` on the host.
 
 From this directory:
 
@@ -94,11 +94,12 @@ MCP client
   -> trusted stdio server
        -> OCI broker -> OCI SDK + host credentials -> OCI APIs
        -> Podman isolation provider
+            -> private no-egress network + localhost mTLS gRPC
             -> locked-down, credential-free container
                  -> fresh Node worker
                       -> isolated-vm V8 isolate
                            -> user JavaScript + injected oci proxy
-                 <-> bounded framed pipe <-> OCI broker
+                 <-> bounded gRPC session <-> OCI broker
 ```
 
 The host owns credentials, OCI clients, request validation, deadlines, budgets,
@@ -110,9 +111,12 @@ the runtime backend.
 ## Security model
 
 - Every call receives a fresh locked-down container, worker, and isolate.
-- Podman runs with no network, a read-only root filesystem, no capabilities,
-  `no-new-privileges`, a non-root user, and CPU, memory, process, file, and
-  temporary-filesystem limits.
+- Podman uses a fresh internal network with no external route and publishes only
+  the runner's gRPC port to host loopback. The container also has a read-only
+  root filesystem, no capabilities, `no-new-privileges`, a non-root user, and
+  CPU, memory, process, file, and temporary-filesystem limits.
+- Each execution gets fresh mutual-TLS identities. The runner receives its
+  server key and the host's public certificate, never the host's private key.
 - Sandbox code cannot import Node modules or directly access files or networks.
 - Credentials, signers, SDK clients, and HTTPS remain in the trusted host.
 - The host validates each request and enforces deadlines, message and result
@@ -136,8 +140,9 @@ npm run ci       # coverage, type checking, and package verification
 ```
 
 Tests use a fake Podman control plane to validate the exact hardened CLI
-arguments and exercise the framed worker protocol without requiring Podman in
-CI. They test this server's command construction, not Podman itself.
+arguments and exercise the same mTLS gRPC session used by the real runner
+without requiring Podman in CI. They test this server's command construction,
+not Podman itself.
 
 The generated sandbox prelude and type-only declarations are excluded from
 source-line instrumentation; their behavior is exercised through integration

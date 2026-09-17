@@ -5,12 +5,20 @@
  * https://oss.oracle.com/licenses/upl.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  Server,
+  ServerCredentials,
+  type ServerDuplexStream
+} from "@grpc/grpc-js";
+import { RUNNER_SERVICE, type ProtocolFrame } from "./grpc.ts";
 import {
   DEFAULT_DECODE_LIMITS,
-  FrameDecoder,
   ProtocolError,
   assertExactFields,
-  encodeFrame,
+  decodePayload,
+  encodePayload,
   protocolMessage
 } from "./protocol.ts";
 import { runJavaScriptInIsolate } from "./sandbox-isolate.ts";
@@ -23,38 +31,95 @@ type PendingRpc = {
 
 // The execute frame contains a trusted, host-generated SDK reflection manifest.
 // Frames emitted by sandbox code are decoded by the host with tighter defaults.
-const decoder = new FrameDecoder({
+const decodeLimits = {
   ...DEFAULT_DECODE_LIMITS,
   maxObjectKeys: 100_000,
   maxNodes: 250_000
-});
+};
 const pendingRpc = new Map<number, PendingRpc>();
 let nextRpcId = 1;
 let running = false;
+let session: ServerDuplexStream<ProtocolFrame, ProtocolFrame> | undefined;
 
-send("health", { status: "ready" });
-process.stdin.on("data", chunk => {
-  try {
-    for (const message of decoder.push(
-      typeof chunk === "string" ? Buffer.from(chunk) : chunk
-    )) {
-      void handleMessage(message).catch(fatal);
-    }
-  } catch (error) {
-    fatal(error);
-  }
+const server = new Server({
+  "grpc.max_receive_message_length": DEFAULT_DECODE_LIMITS.maxFrameBytes,
+  "grpc.max_send_message_length": DEFAULT_DECODE_LIMITS.maxFrameBytes
 });
-process.stdin.on("end", () => {
-  try {
-    decoder.end();
-  } catch (error) {
-    fatal(error);
+server.addService(RUNNER_SERVICE, { session: openSession });
+void startServer().catch(fatal);
+
+function openSession(call: ServerDuplexStream<ProtocolFrame, ProtocolFrame>): void {
+  if (session) {
+    call.end();
     return;
   }
-  rejectPending(new Error("sandbox host channel closed"));
-  process.exitCode = 1;
-});
-process.stdin.resume();
+  session = call;
+  call.on("data", frame => {
+    try {
+      void handleMessage(decodePayload(frame.payload, decodeLimits)).catch(fatal);
+    } catch (error) {
+      fatal(error);
+    }
+  });
+  call.on("error", fatal);
+  call.on("cancelled", () => {
+    rejectPending(new Error("sandbox host channel closed"));
+    process.exit(1);
+  });
+  send("health", { status: "ready" });
+}
+
+async function startServer(): Promise<void> {
+  const tls = await loadTls();
+  const credentials = ServerCredentials.createSsl(
+    Buffer.from(tls.clientCert),
+    [{
+      private_key: Buffer.from(tls.serverKey),
+      cert_chain: Buffer.from(tls.serverCert)
+    }],
+    true
+  );
+  const port = Number(process.env.OCI_JAVASCRIPT_RUNNER_PORT ?? 50051);
+  if (!isPositiveInteger(port) || port > 65535) {
+    throw new Error("invalid sandbox runner port");
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.bindAsync(`0.0.0.0:${port}`, credentials, error => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function loadTls(): Promise<{
+  serverKey: string;
+  serverCert: string;
+  clientCert: string;
+}> {
+  if (process.env.OCI_JAVASCRIPT_RUNNER_TLS_STDIN === "1") {
+    let input = "";
+    for await (const chunk of process.stdin) {
+      input += String(chunk);
+      if (Buffer.byteLength(input, "utf8") > 32 * 1024) {
+        throw new Error("sandbox TLS bootstrap is too large");
+      }
+    }
+    const value = JSON.parse(input) as unknown;
+    if (!isTlsBootstrap(value)) {
+      throw new Error("invalid sandbox TLS bootstrap");
+    }
+    return value;
+  }
+  const directory = process.env.OCI_JAVASCRIPT_RUNNER_TLS_DIR ?? "/run/oci-runner";
+  return {
+    serverKey: readFileSync(join(directory, "server.key"), "utf8"),
+    serverCert: readFileSync(join(directory, "server.crt"), "utf8"),
+    clientCert: readFileSync(join(directory, "client.crt"), "utf8")
+  };
+}
 
 async function handleMessage(message: JsonObject): Promise<void> {
   if (message.type === "execute") {
@@ -159,14 +224,20 @@ function hostRpc(request: unknown): Promise<Json> {
 }
 
 function send(type: string, fields: JsonObject = {}): void {
-  process.stdout.write(encodeFrame(protocolMessage(type, fields)));
+  if (!session || session.destroyed || session.writableEnded) {
+    throw new Error("sandbox host channel is closed");
+  }
+  session.write({ payload: encodePayload(protocolMessage(type, fields)) });
 }
 
 function sendAndExit(type: string, fields: JsonObject, exitCode: number): void {
-  process.stdout.write(
-    encodeFrame(protocolMessage(type, fields)),
-    () => process.exit(exitCode)
-  );
+  if (!session) {
+    process.exit(exitCode);
+  }
+  session.write({ payload: encodePayload(protocolMessage(type, fields)) }, () => {
+    session?.end();
+    server.tryShutdown(() => process.exit(exitCode));
+  });
 }
 
 function fatal(_error: unknown): void {
@@ -192,4 +263,16 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isTlsBootstrap(value: unknown): value is {
+  serverKey: string;
+  serverCert: string;
+  clientCert: string;
+} {
+  return isObject(value)
+    && Object.keys(value).length === 3
+    && typeof value.serverKey === "string"
+    && typeof value.serverCert === "string"
+    && typeof value.clientCert === "string";
 }

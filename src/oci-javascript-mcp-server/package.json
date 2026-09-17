@@ -40,10 +40,12 @@
     "prepublishOnly": "npm run ci"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "isolated-vm": "^7.0.0",
     "oci-common": "^2.132.0",
     "oci-sdk": "^2.132.0",
+    "selfsigned": "^3.0.1",
     "zod": "^4.4.3"
   },
   "overrides": {

@@ -4,19 +4,23 @@
  * https://oss.oracle.com/licenses/upl.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import {
-  FrameDecoder,
+  compressionAlgorithms,
+  status,
+  type ChannelCredentials,
+  type ClientDuplexStream
+} from "@grpc/grpc-js";
+import { RunnerClient, type ProtocolFrame } from "../grpc.ts";
+import {
+  DEFAULT_MAX_FRAME_BYTES,
   ProtocolError,
   assertExactFields,
-  encodeFrame,
+  decodePayload,
+  encodePayload,
   protocolMessage
 } from "../protocol.ts";
-import {
-  appendCapped,
-  MAX_STDERR_BYTES,
-  MAX_STDOUT_BYTES
-} from "../sandbox-common.ts";
+import { appendCapped, MAX_STDERR_BYTES, MAX_STDOUT_BYTES } from "../sandbox-common.ts";
 import type {
   IsolationExecution,
   IsolationRunOptions,
@@ -25,13 +29,23 @@ import type {
   SandboxResult
 } from "../types.ts";
 
-export function startPipeExecution(
-  child: ChildProcessWithoutNullStreams,
+const GRPC_OPTIONS = {
+  "grpc.default_compression_algorithm": compressionAlgorithms.identity,
+  "grpc.enable_retries": 0,
+  "grpc.max_receive_message_length": DEFAULT_MAX_FRAME_BYTES,
+  "grpc.max_send_message_length": DEFAULT_MAX_FRAME_BYTES,
+  "grpc.ssl_target_name_override": "oci-javascript-runner"
+} as const;
+
+export function startGrpcExecution(
+  child: ChildProcess,
+  address: string,
+  credentials: ChannelCredentials,
   code: string,
-  input: IsolationRunOptions & { memoryLimitMb: number; maxResultBytes: number },
-  afterClose?: () => Promise<void>
+  input: IsolationRunOptions & { memoryLimitMb: number; maxResultBytes: number }
 ): IsolationExecution {
-  const decoder = new FrameDecoder();
+  const client = new RunnerClient(address, credentials, GRPC_OPTIONS);
+  let call: ClientDuplexStream<ProtocolFrame, ProtocolFrame> | undefined;
   let stdout = "";
   let stderr = "";
   let ready = false;
@@ -51,11 +65,12 @@ export function startPipeExecution(
     if (workerCompleted && !closed) {
       await waitForClose(close, 500);
     }
+    call?.cancel();
+    client.close();
     if (!closed) {
       killChildTree(child);
     }
     await close;
-    await afterClose?.();
   })();
 
   const finish = (value: SandboxResult, stop = false) => {
@@ -79,16 +94,25 @@ export function startPipeExecution(
     timedOut: false
   }, stop);
 
-  child.stdout.on("data", chunk => {
-    try {
-      for (const message of decoder.push(chunk)) {
-        void handleWorkerMessage(message, child, input, {
+  client.waitForReady(input.deadlineMs, error => {
+    if (error) {
+      finish(timeoutResult(), true);
+      return;
+    }
+    if (settled) {
+      return;
+    }
+    call = client.session({ deadline: input.deadlineMs });
+    call.on("data", frame => {
+      try {
+        const message = decodePayload(frame.payload);
+        void handleWorkerMessage(message, call!, input, {
           ready() {
             if (ready) {
               throw new ProtocolError("sandbox worker sent duplicate health message");
             }
             ready = true;
-            send(child, "execute", {
+            send(call!, "execute", {
               code,
               timeoutMs: Math.max(1, input.deadlineMs - Date.now()),
               reflectionManifest: input.reflectionManifest ?? { services: {} },
@@ -108,22 +132,21 @@ export function startPipeExecution(
             finish(value, stop);
           }
         }).catch(() => fail("sandbox protocol failed"));
+      } catch {
+        fail("sandbox protocol failed");
       }
-    } catch {
-      fail("sandbox protocol failed");
-    }
+    });
+    call.once("error", error => {
+      if (error.code === status.DEADLINE_EXCEEDED) {
+        finish(timeoutResult(), true);
+      } else {
+        fail("sandbox protocol failed");
+      }
+    });
+    call.once("end", () => fail("sandbox protocol failed"));
   });
-  child.stderr.resume();
   child.once("error", () => fail("sandbox runner failed", false));
   child.once("close", (exitCode, signal) => {
-    try {
-      decoder.end();
-    } catch {
-      if (!settled) {
-        fail("sandbox protocol failed", false);
-        return;
-      }
-    }
     if (!settled) {
       fail(
         `sandbox runner exited before returning a result (${signal ?? exitCode ?? "unknown"})`,
@@ -132,17 +155,18 @@ export function startPipeExecution(
     }
   });
 
-  const timeout = setTimeout(() => {
-    finish(timeoutResult(), true);
-  }, Math.max(1, input.deadlineMs - Date.now()));
+  const timeout = setTimeout(() => finish(timeoutResult(), true), Math.max(
+    1,
+    input.deadlineMs - Date.now()
+  ));
   timeout.unref();
   const abort = () => {
-    if (child.stdin.writable) {
-      try {
-        send(child, "cancel");
-      } catch {
-        // Forced teardown below remains authoritative.
+    try {
+      if (call) {
+        send(call, "cancel");
       }
+    } catch {
+      // Forced teardown below remains authoritative.
     }
     finish(timeoutResult(), true);
   };
@@ -151,50 +175,9 @@ export function startPipeExecution(
   return { result, terminate };
 }
 
-export function runnerEnvironment(): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {};
-  for (const name of ["PATH", "TMPDIR", "TMP", "TEMP", "NODE_V8_COVERAGE"]) {
-    if (process.env[name]) {
-      environment[name] = process.env[name];
-    }
-  }
-  return environment;
-}
-
-export function runCleanupCommand(command: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const cleanup = spawn(command, args, {
-      env: runnerEnvironment(),
-      stdio: "ignore"
-    });
-    const finish = (error?: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
-    };
-    cleanup.once("error", () => finish(new Error("Podman cleanup command failed")));
-    cleanup.once("close", code => finish(
-      code === 0 ? undefined : new Error("Podman cleanup command exited unsuccessfully")
-    ));
-    const timeout = setTimeout(() => {
-      cleanup.kill("SIGKILL");
-      finish(new Error("Podman cleanup command timed out"));
-    }, 5_000);
-    timeout.unref();
-  });
-}
-
 async function handleWorkerMessage(
   message: JsonObject,
-  child: ChildProcessWithoutNullStreams,
+  call: ClientDuplexStream<ProtocolFrame, ProtocolFrame>,
   input: IsolationRunOptions,
   callbacks: {
     ready(): void;
@@ -232,7 +215,7 @@ async function handleWorkerMessage(
     } catch {
       rpcResult = { ok: false, error: { message: "OCI call failed" } };
     }
-    send(child, "rpc_result", { id: message.id, result: rpcResult });
+    send(call, "rpc_result", { id: message.id, result: rpcResult });
     return;
   }
   if (message.type === "result") {
@@ -262,17 +245,17 @@ async function handleWorkerMessage(
 }
 
 function send(
-  child: ChildProcessWithoutNullStreams,
+  call: ClientDuplexStream<ProtocolFrame, ProtocolFrame>,
   type: string,
   fields: JsonObject = {}
 ): void {
-  if (!child.stdin.writable) {
+  if (call.destroyed || call.writableEnded) {
     throw new Error("sandbox runner channel is closed");
   }
-  child.stdin.write(encodeFrame(protocolMessage(type, fields)));
+  call.write({ payload: encodePayload(protocolMessage(type, fields)) });
 }
 
-function killChildTree(child: ChildProcessWithoutNullStreams): void {
+function killChildTree(child: ChildProcess): void {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
   }

@@ -491,7 +491,7 @@ test("sandbox returns a trailing expression as structured result", async () => {
   assert.equal(result.result, 42);
 });
 
-test("sandbox rejects oversized structured results before parent IPC", async () => {
+test("sandbox rejects oversized structured results before host RPC", async () => {
   const result = await runJavaScript(
     `"x".repeat(1024 * 1024);`,
     {

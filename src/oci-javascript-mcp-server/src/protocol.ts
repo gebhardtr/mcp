@@ -35,11 +35,16 @@ export type ProtocolMessage = JsonObject & {
   type: string;
 };
 
-export function encodeFrame(message: JsonObject, maxBytes = DEFAULT_MAX_FRAME_BYTES): Buffer {
+export function encodePayload(message: JsonObject, maxBytes = DEFAULT_MAX_FRAME_BYTES): Buffer {
   const body = Buffer.from(JSON.stringify(message), "utf8");
   if (body.length > maxBytes) {
     throw new ProtocolError(`frame length ${body.length} exceeds limit ${maxBytes}`);
   }
+  return body;
+}
+
+export function encodeFrame(message: JsonObject, maxBytes = DEFAULT_MAX_FRAME_BYTES): Buffer {
+  const body = encodePayload(message, maxBytes);
   const header = Buffer.allocUnsafe(4);
   header.writeUInt32BE(body.length, 0);
   return Buffer.concat([header, body]);
