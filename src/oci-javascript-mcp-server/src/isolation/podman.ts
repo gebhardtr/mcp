@@ -43,14 +43,12 @@ export class PodmanIsolationProvider implements IsolationProvider {
     const tls = createTlsBootstrap();
     let active: IsolationExecution | undefined;
     let child: ChildProcess | undefined;
-    let networkCreated = false;
     let stopping = false;
     let startupError: unknown;
     const ready = (async () => {
       await runPodman(this.#cliPath, [
         "network", "create", "--internal", "--disable-dns", network
       ]);
-      networkCreated = true;
       if (stopping) {
         throw new Error("sandbox execution cancelled");
       }
@@ -127,10 +125,8 @@ export class PodmanIsolationProvider implements IsolationProvider {
         await runPodman(this.#cliPath, ["rm", "--force", "--ignore", name])
           .catch(error => errors.push(error));
       }
-      if (networkCreated) {
-        await runPodman(this.#cliPath, ["network", "rm", network])
-          .catch(error => errors.push(error));
-      }
+      await runPodman(this.#cliPath, ["network", "rm", "--ignore", network])
+        .catch(error => errors.push(error));
       if (errors.length > 0) {
         throw errors[0];
       }

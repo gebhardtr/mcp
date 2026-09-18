@@ -5,6 +5,9 @@
  */
 
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { PodmanIsolationProvider } from "../src/isolation/podman.ts";
@@ -45,6 +48,32 @@ test("Podman provider rejects unsafe executable and image inputs", () => {
     () => new PodmanIsolationProvider({ image: "--privileged" }),
     /image is invalid/
   );
+});
+
+test("Podman removes the execution network even when creation reports failure", async t => {
+  const spawn = t.mock.method(childProcess, "spawn", (_command: string, args: string[]) => {
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", args[1] === "create" ? 1 : 0));
+    return child as childProcess.ChildProcess;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const execution = new PodmanIsolationProvider().run("42", {
+    deadlineMs: Date.now() + 10_000,
+    signal: new AbortController().signal,
+    hostRpc: async () => null
+  });
+  await assert.rejects(execution.result, /Podman command exited unsuccessfully/);
+  await execution.terminate();
+  const commands = spawn.mock.calls.map(call => call.arguments[1]);
+  const network = commands[0].at(-1);
+  assert.deepEqual(commands, [
+    ["network", "create", "--internal", "--disable-dns", network],
+    ["network", "rm", "--ignore", network]
+  ]);
 });
 
 test("sandbox delegates execution through the selected isolation provider", async () => {
